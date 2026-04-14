@@ -11,7 +11,22 @@ Flip PILOT=False for the full 12-run sweep.
 """
 
 import os
+import subprocess
 import sys
+
+# Kaggle's current PyTorch image drops sm_60 (P100). Force a build that still
+# ships sm_60 kernels so we work regardless of which GPU the pool assigns.
+# ~60s one-time install.
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", "-q",
+    "torch==2.3.1", "--index-url", "https://download.pytorch.org/whl/cu121",
+])
+
+import torch  # noqa: E402
+print(f"[diag] torch={torch.__version__} "
+      f"cuda_available={torch.cuda.is_available()} "
+      f"device_count={torch.cuda.device_count()} "
+      f"device_name={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'}")
 
 REPO_DIR = "/kaggle/input/pollysec-pkg"
 WORK_DIR = "/kaggle/working"

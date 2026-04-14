@@ -137,7 +137,7 @@ class RegisterMechanism(nn.Module):
 VARIANTS = {"vanilla", "vanilla_reg", "looped", "looped_reg"}
 
 # Hyperparameters (fixed by spec)
-VOCAB_SIZE = 5       # PAD=0, (=1, )=2, CLS=3, (index 4 unused but reserved)
+VOCAB_SIZE = 8       # PAD=0, (=1, )=2, [=3, ]=4, {=5, }=6, CLS=7
 MAX_SEQ_LEN = 34     # 1 CLS + up to 32 bracket chars + padding
 DIM = 64
 N_HEADS = 4

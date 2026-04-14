@@ -46,8 +46,8 @@ CHECKPOINT_EVERY = 2_000
 LOG_EVERY = 100
 VAL_EVERY = 1_000
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
-CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
+DATA_DIR = Path(os.environ.get("POLLY_DATA_DIR", Path(__file__).resolve().parent / "data"))
+CHECKPOINT_DIR = Path(os.environ.get("POLLY_CHECKPOINT_DIR", Path(__file__).resolve().parent / "checkpoints"))
 
 
 # ---------------------------------------------------------------------------

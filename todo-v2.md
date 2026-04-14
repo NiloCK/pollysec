@@ -32,28 +32,37 @@ hypothesis to prove.
 
 ## Phase A — Task redesign
 
-- [ ] **A.1** Update `data.py`
-  - [ ] Expand vocab: PAD=0, `(`=1, `)`=2, `[`=3, `]`=4, `{`=5, `}`=6, CLS=7
-  - [ ] `generate_balanced(depth, rng)` picks a random bracket type at each
+- [x] **A.1** Update `data.py`
+  - [x] Expand vocab: PAD=0, `(`=1, `)`=2, `[`=3, `]`=4, `{`=5, `}`=6, CLS=7
+  - [x] `generate_balanced(depth, rng)` picks a random bracket type at each
         opener; closer must match the corresponding opener (stack discipline)
-  - [ ] Corruption set must include **type-mismatch swaps** (e.g., replace a
+  - [x] Corruption set must include **type-mismatch swaps** (e.g., replace a
         closer with a different-type closer — counts unchanged, still invalid).
         Keep existing flip/delete/insert too, but mismatch should be a
         meaningful fraction (~50%) to force stack behavior.
-  - [ ] Regenerate all splits (same seeds, same depth bands, same sizes)
-  - [ ] Add a sanity check: for each unbalanced example, verify it would
+        **Result:** ~63% mismatch, ~13% flip, ~13% delete, ~11% insert
+  - [x] Regenerate all splits (same seeds, same depth bands, same sizes)
+  - [x] Add a sanity check: for each unbalanced example, verify it would
         pass the single-type counter test but fails the typed-stack test —
-        at least for the mismatch corruptions
-  - [ ] Update `MAX_SEQ_LEN` if vocab/format changes require it
+        at least for the mismatch corruptions.
+        **Result:** 100% of mismatch corruptions pass counter test but fail stack test ✓
+  - [x] Update `MAX_SEQ_LEN` if vocab/format changes require it — **no change needed**, stays 34
+  - [x] v1 data backed up to `polly/data/v1/`
+  - [x] `corrupt_balanced` now returns `(string, corruption_type)` tuple; JSONL includes `"corruption"` field
 
-- [ ] **A.2** Update `model.py`
-  - [ ] Expand token embedding to new vocab size (8)
-  - [ ] Everything else stays the same (same 4 variants, same params)
-  - [ ] Sanity-check param counts move only by the embedding delta
+- [x] **A.2** Update `model.py`
+  - [x] Expand token embedding to new vocab size (8) — `VOCAB_SIZE = 8`
+  - [x] Everything else stays the same (same 4 variants, same params)
+  - [x] Sanity-check param counts move only by the embedding delta
+        **Result:** +192 params for every variant, exactly matching `(8 - 5) * 64`
 
-- [ ] **A.3** Smoke test
-  - [ ] Re-run overfit-100 sanity: all 4 variants still hit ~100% on tiny set
-  - [ ] Generate a dozen examples by hand, confirm mismatch corruptions look right
+- [~] **A.3** Smoke test
+  - [~] Re-run overfit-100 sanity: all 4 variants still hit ~100% on tiny set
+        **Status:** partial local verification complete before compute was intentionally cut off.
+        `vanilla`, `vanilla_reg`, and `looped` hit 100% on tiny-set overfit checks.
+        `looped_reg` was started but not completed locally; prefer finishing this on Kaggle/cloud.
+  - [x] Generate a dozen examples by hand, confirm mismatch corruptions look right
+        (verified via data generation output — mismatch examples all pass counter test)
 
 ---
 

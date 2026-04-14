@@ -4,125 +4,174 @@
 
 An empirical investigation into whether looped (recursive) transformer architectures spontaneously develop internal control state — specifically, whether the model learns to use dedicated architectural "registers" as recursion counters when solving depth-variable problems.
 
-## Quick Start
+> **Status (v3 / 2026-04-14):** single-range depth-curve probe. Training and test both sample from depths 1..D_max (currently 45). The experimental signal is a per-depth accuracy curve: where does each architecture's line start to fall? See `todo-v3.md` for design rationale. v1 (single-type) and v2 (IID/OOD-split multi-type) are deprecated — see banners in `todo.md` / `todo-v2.md`.
+
+---
+
+## Current task (v3)
+
+**Binary classification:** given a string of `()`, `[]`, `{}` (3 bracket types), output `balanced` or `unbalanced`. Stack discipline is required — `([)]` is balanced by per-type counts but invalid.
+
+- Depths: 1–45, uniformly sampled in every split.
+- `MAX_SEQ_LEN = 96` (1 CLS + 2·45 brackets + PAD).
+- 50/50 balanced/unbalanced per depth. Corruption mix ~65% type-mismatch, ~15% delete, ~15% flip, ~5% insert.
+
+| Split | Size | Per-depth |
+|---|---|---|
+| `train.jsonl` | 225,000 | 5,000 |
+| `val.jsonl`   | 18,000  | 400 |
+| `test.jsonl`  | 18,000  | 400 |
+
+Regenerate with: `python -m polly.data`
+
+---
+
+## Model variants
+
+Four variants forming a 2×2 grid — looping (yes/no) × registers (yes/no):
+
+| Variant        | Looping     | Registers | ~Params | Description                              |
+|----------------|-------------|-----------|---------|------------------------------------------|
+| `vanilla`      | No          | No        | 298K    | Baseline transformer                     |
+| `vanilla_reg`  | No          | Yes       | 301K    | Registers w/o looping (control)          |
+| `looped`       | Yes (4 iter)| No        | 298K    | Weight-tied layers, rerun 4×             |
+| `looped_reg`   | Yes (4 iter)| Yes       | 301K    | Looped + cross-iteration register        |
+
+Hidden dim 64, 4 heads, bidirectional attention, classification from CLS.
+
+---
+
+## Playing with trained models locally
+
+Training happens on Kaggle (see "Cloud training" below). Checkpoints come back as `kaggle_output/checkpoints/{variant}_seed{seed}/best.pt`. The eval/probe/ablate scripts respect env vars so you can point them at any checkpoint tree without symlinking or moving files.
+
+### Setup
 
 ```bash
-# Set up environment
-python3 -m venv .venv
-source .venv/bin/activate
-pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-# Generate data (deterministic, run once)
-python polly/data.py
-
-# Train a single variant
-python -m polly.train --variant vanilla --seed 100
-python -m polly.train --variant looped_reg --seed 100
-
-# Evaluate
-python -m polly.evaluate --variant vanilla --seed 100
-python -m polly.evaluate --all
+source .venv/bin/activate                                   # torch + deps
+export POLLY_CHECKPOINT_DIR=$(pwd)/kaggle_output/checkpoints # where Kaggle put best.pt
+# POLLY_DATA_DIR defaults to polly/data/ — only override if you want v2/v1 data
 ```
 
-## Model Variants
-
-Four variants form a 2×2 grid — looping (yes/no) × registers (yes/no):
-
-| Variant | Looping | Registers | Params | Description |
-|---|---|---|---|---|
-| `vanilla` | No | No | ~298K | Baseline 6-layer transformer |
-| `vanilla_reg` | No | Yes | ~301K | Registers without looping (control) |
-| `looped` | Yes (4 iter) | No | ~298K | Weight-tied layers, rerun 4× |
-| `looped_reg` | Yes (4 iter) | Yes | ~301K | Looped + cross-iteration register |
-
-All variants use: hidden dim 64, 4 attention heads, 6 layers, bidirectional attention, classification from CLS token.
-
-## Task
-
-**Binary classification:** Given a string of `(` and `)`, output `balanced` or `unbalanced`.
-
-- **Training depths:** 1–8
-- **Test depths:** 1–16 (depths 9–16 are out-of-distribution)
-
-The key question: does the looped + register variant generalise to depths beyond training, and does the register encode recursion-relevant state (nesting depth, iteration count)?
-
-## Data
-
-Generated deterministically from fixed seeds. Run `python polly/data.py` once.
-
-| Split | Depths | Seed | Size |
-|---|---|---|---|
-| `train.jsonl` | 1–8 | 42 | 200,000 |
-| `val.jsonl` | 1–8 | 43 | 10,000 |
-| `test_id.jsonl` | 1–8 | 44 | 10,000 |
-| `test_ood.jsonl` | 9–16 | 45 | 10,000 |
-
-50/50 balanced/unbalanced at every depth.
-
-## Training
+### Per-depth accuracy (the main figure)
 
 ```bash
-# Full training matrix: 4 variants × 3 seeds = 12 runs
-for variant in vanilla vanilla_reg looped looped_reg; do
-  for seed in 100 200 300; do
-    python -m polly.train --variant $variant --seed $seed
-  done
+# Single run — table of per-depth accuracy (+ avg exit iter for looped)
+python -m polly.evaluate --variant vanilla --seed 100 --device cpu
+python -m polly.evaluate --variant looped  --seed 100 --device cpu
+
+# All variants × seeds — aggregated mean±std per depth, writes summary JSON
+python -m polly.evaluate --all --device cpu
+
+# Force looped to run all 4 iterations (ignore exit gate) — diagnostic
+python -m polly.evaluate --variant looped --seed 100 --force-all-iters
+```
+
+Eval JSONs land in `polly/figures/eval_*.json` (gitignored).
+
+### Quick per-depth curve from a training log
+
+Faster than running evaluate — just scrapes the `final` record that training writes:
+
+```bash
+for v in vanilla looped; do
+  echo "=== $v ==="
+  python3 -c "
+import json
+rec = [json.loads(l) for l in open(f'kaggle_output/checkpoints/${v}_seed100/log.jsonl') if '\"type\": \"final\"' in l][0]
+for d in range(1, 46):
+    k = f'val_acc_depth_{d}'
+    if k in rec:
+        print(f'  {d:>2}: {rec[k]:.3f}')
+"
 done
 ```
 
-- **Optimiser:** AdamW, lr=3e-4, cosine decay, 1000-step warmup
-- **Steps:** 30,000 (batch size 128)
-- **Checkpoints:** saved every 2,000 steps; best model by val accuracy
-
-### Compute Estimates (CPU)
-
-| Variant | Steps/sec | Time for 30K steps |
-|---|---|---|
-| `vanilla` / `vanilla_reg` | ~6 | ~83 min |
-| `looped` / `looped_reg` | ~1.8 | ~4.5 hrs |
-
-GPU (Kaggle free tier) will be significantly faster.
-
-## Evaluation & Analysis
+### Probing + ablation
 
 ```bash
-# Accuracy vs. depth (hero plot)
-python -m polly.evaluate --all
-
-# Probing analysis (on trained looped_reg)
+# Activation probes — does the register encode depth / iteration count?
 python -m polly.probe --variant looped_reg --seed 100
 
-# Ablation experiments
+# Head / register ablations — what breaks generalisation?
 python -m polly.ablate --variant looped_reg --seed 100
 ```
 
-## Repository Structure
+Both are `POLLY_CHECKPOINT_DIR`-aware.
+
+### Heads-up on checkpoint compatibility
+
+Position embeddings are sized by `MAX_SEQ_LEN` (currently 96). A checkpoint trained at `MAX_SEQ_LEN=34` (v1) or `66` (v3 early) will **not load** against the current model — shape mismatch on `pos_emb.weight`. To eval historical checkpoints, temporarily revert `MAX_SEQ_LEN` in `polly/model.py` + `polly/data.py` to match the training run, or git-checkout the commit that produced them.
+
+---
+
+## Cloud training (Kaggle)
+
+Local CPU training is prohibitively slow for this model — use Kaggle's free P100. The dataset + kernel are already configured:
+
+```bash
+# 1. Push fresh dataset (excludes archives + checkpoints)
+STAGE=$(mktemp -d)
+cp dataset-metadata.json "$STAGE/"
+rsync -a --exclude '__pycache__' --exclude 'checkpoints' --exclude 'figures' \
+    --exclude 'data/v1' --exclude 'data/v2' --exclude 'data/v3-d30' \
+    polly "$STAGE/"
+kaggle datasets version -p "$STAGE" -m "data refresh" --dir-mode zip
+rm -rf "$STAGE"
+kaggle datasets status colinmorgankennedy/pollysec-pkg   # wait for 'ready'
+
+# 2. Push kernel (runs kaggle/run_kaggle.py)
+kaggle kernels push -p kaggle/
+
+# 3. Watch
+kaggle kernels status colinmorgankennedy/pollysec-train
+# UI: https://www.kaggle.com/code/colinmorgankennedy/pollysec-train
+
+# 4. When done, pull outputs
+kaggle kernels output colinmorgankennedy/pollysec-train -p ./kaggle_output
+```
+
+Edit `kaggle/run_kaggle.py` to toggle `PILOT` (2 variants × 1 seed × 3k steps) vs. the full 12-run sweep. Kaggle kernel runs on a P100 with torch downgraded to 2.3.1 at runtime (the base image's torch drops sm_60).
+
+---
+
+## Repo structure
 
 ```
 polly/
-├── README.md           # This file
+├── README.md          # this file
 ├── __init__.py
-├── data.py             # Data generation + BracketDataset
-├── model.py            # All four model variants
-├── train.py            # Training loop
-├── evaluate.py         # Accuracy vs. depth evaluation
-├── probe.py            # Probing analysis (TODO)
-├── ablate.py           # Ablation experiments (TODO)
-├── plot.py             # Figure generation (TODO)
-├── data/               # Generated JSONL splits
-├── checkpoints/        # Saved models
-└── figures/            # Generated plots
+├── data.py            # generation + BracketDataset (respects POLLY_DATA_DIR)
+├── model.py           # all four variants (MAX_SEQ_LEN lives here too)
+├── train.py           # training loop (respects POLLY_CHECKPOINT_DIR)
+├── evaluate.py        # per-depth accuracy / aggregation
+├── probe.py           # activation probes on trained checkpoints
+├── ablate.py          # component ablations
+├── run_all.sh         # local 12-run sweep (if you're brave)
+├── data/              # v3 splits + v1/v2/v3-d30 archives
+├── checkpoints/       # local training output (gitignored)
+└── figures/           # eval/probe JSON + plots (gitignored)
+
+kaggle/
+├── kernel-metadata.json
+└── run_kaggle.py      # kernel entrypoint — handles sm_60 torch + symlinks
 ```
 
-## What Success Looks Like
+---
 
-- `looped_reg` maintains >80% accuracy at depths 9–16 (OOD)
-- `vanilla` collapses to <30% at OOD depths
-- Probing reveals the register cleanly encodes nesting depth and iteration count
-- Ablating the register destroys extrapolation while preserving in-distribution performance
+## What success looks like (v3)
+
+- **Per-depth curve shows a gap.** `looped` / `looped_reg` maintain accuracy at deeper depths where `vanilla` breaks down.
+- **Exit gate meaningfully fires.** `avg_exit_iter` grows with depth — looping buys compute when compute is needed, not always.
+- **Probing confirms register encodes recursion state.** A linear probe on the register's value predicts current nesting depth / iteration number substantially above chance.
+- **Ablating the register destroys deep-depth accuracy** while preserving shallow performance.
+
+If the per-depth curves overlap at every depth, looping's architectural story didn't pan out on this task — also a real finding, and the cue to escalate (see `todo-v3.md` Phase D: ListOps / arithmetic eval).
+
+---
 
 ## References
 
-- Ouro/LoopLM (ByteDance, arxiv 2510.25741)
+- Ouro / LoopLM (ByteDance, arXiv:2510.25741)
 - Mixture-of-Recursions (Google, 2026)
 - LoopFormer, SpiralFormer (late 2025 / early 2026)

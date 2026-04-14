@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Checkpoints (large binary files — keep only best runs manually)
+polly/checkpoints/
+
+# Generated figures (reproducible from code)
+polly/figures/*.png
+polly/figures/*.pdf
+polly/figures/*.svg
+
+# Data splits (reproducible from data.py, but small enough to commit)
+# Uncomment to ignore:
+# polly/data/*.jsonl
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# PyTorch
+*.pt
+*.pth
+
+# Jupyter
+.ipynb_checkpoints/

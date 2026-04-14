@@ -45,9 +45,9 @@ EVAL_BATCH_SIZE = 256
 DEFAULT_T_MAX = 4
 DEFAULT_EXIT_THRESHOLD = 0.8
 
-DATA_DIR = Path(__file__).resolve().parent / "data"
-CHECKPOINT_DIR = Path(__file__).resolve().parent / "checkpoints"
-FIGURES_DIR = Path(__file__).resolve().parent / "figures"
+DATA_DIR = Path(os.environ.get("POLLY_DATA_DIR", Path(__file__).resolve().parent / "data"))
+CHECKPOINT_DIR = Path(os.environ.get("POLLY_CHECKPOINT_DIR", Path(__file__).resolve().parent / "checkpoints"))
+FIGURES_DIR = Path(os.environ.get("POLLY_FIGURES_DIR", Path(__file__).resolve().parent / "figures"))
 
 
 # ---------------------------------------------------------------------------

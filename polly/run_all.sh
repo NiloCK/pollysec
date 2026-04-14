@@ -73,11 +73,17 @@ for variant in "${VARIANTS[@]}"; do
         RUN=$((RUN + 1))
         RUN_TAG="${variant}_seed${seed}"
 
-        # Skip if best.pt already exists (resume-friendly)
+        # Skip if best.pt was trained at the requested step count (resume-friendly).
+        # Older checkpoints without a 'total_steps' field are treated as stale.
         BEST_CKPT="$SCRIPT_DIR/checkpoints/${RUN_TAG}/best.pt"
         if [ -f "$BEST_CKPT" ]; then
-            echo "[$RUN/$TOTAL] $RUN_TAG — best.pt exists, skipping."
-            continue
+            CKPT_STEPS=$(python3 -c "import torch,sys; c=torch.load(sys.argv[1], map_location='cpu', weights_only=False); print(c.get('total_steps', -1))" "$BEST_CKPT" 2>/dev/null || echo -1)
+            if [ "$CKPT_STEPS" = "$STEPS" ]; then
+                echo "[$RUN/$TOTAL] $RUN_TAG — best.pt at ${STEPS} steps exists, skipping."
+                continue
+            else
+                echo "[$RUN/$TOTAL] $RUN_TAG — existing best.pt trained for ${CKPT_STEPS} steps (want ${STEPS}); retraining."
+            fi
         fi
 
         echo ""

@@ -278,6 +278,7 @@ def save_checkpoint(
     step: int,
     best_val_acc: float,
     seed: int,
+    total_steps: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -287,6 +288,7 @@ def save_checkpoint(
             "step": step,
             "best_val_acc": best_val_acc,
             "seed": seed,
+            "total_steps": total_steps,
         },
         path,
     )
@@ -480,14 +482,14 @@ def train(
                     best_val_acc = val_acc
                     save_checkpoint(
                         run_dir / "best.pt",
-                        model, optimizer, step, best_val_acc, seed,
+                        model, optimizer, step, best_val_acc, seed, total_steps,
                     )
                     print(f"  [val] New best! val_acc={val_acc:.4f} — saved best.pt")
 
             # ----- Checkpointing (every CHECKPOINT_EVERY steps) -----
             if step % CHECKPOINT_EVERY == 0:
                 ckpt_path = run_dir / f"step_{step}.pt"
-                save_checkpoint(ckpt_path, model, optimizer, step, best_val_acc, seed)
+                save_checkpoint(ckpt_path, model, optimizer, step, best_val_acc, seed, total_steps)
                 print(f"  [ckpt] Saved {ckpt_path}")
 
     # ----- Final -----
@@ -498,7 +500,7 @@ def train(
     # Save final checkpoint
     save_checkpoint(
         run_dir / f"step_{step}.pt",
-        model, optimizer, step, best_val_acc, seed,
+        model, optimizer, step, best_val_acc, seed, total_steps,
     )
     print(f"[train] Final checkpoint saved.")
 

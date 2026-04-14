@@ -1,5 +1,17 @@
 # Polly — Implementation TODO
 
+> # ⚠️ DEPRECATED — 2026-04-14
+> #
+> # Superseded by [`todo-v2.md`](./todo-v2.md).
+> #
+> # v1 task (single bracket type) is a **one-counter language**, not
+> # context-free — solvable without a stack. Vanilla hit 100% IID *and* OOD
+> # across all seeds, leaving no headroom for looped variants to prove
+> # anything. See `todo-v2.md` for the multi-type redesign and rationale.
+> #
+> # Phase 1 and Phase 2 records below remain accurate as historical state.
+> # Phase 3/4 items are obsolete — do not work from them.
+
 > Extracted from `init.md` spec v1.0. Update status as work progresses.
 > Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked/decision needed
 

@@ -16,10 +16,11 @@ env/
 # Checkpoints (large binary files — keep only best runs manually)
 polly/checkpoints/
 
-# Generated figures (reproducible from code)
-polly/figures/*.png
-polly/figures/*.pdf
-polly/figures/*.svg
+# Generated figures + eval JSONs (reproducible from code)
+polly/figures/
+
+# Kaggle kernel output (reproducible by re-running the kernel)
+kaggle_output/
 
 # Data splits (reproducible from data.py, but small enough to commit)
 # Uncomment to ignore:

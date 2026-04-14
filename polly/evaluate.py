@@ -233,32 +233,22 @@ def print_accuracy_table(
     print("=" * 72)
 
     if is_looped:
-        header = f"  {'Depth':>5}  {'Accuracy':>10}  {'Avg Exit Iter':>14}  {'Split':>6}"
+        header = f"  {'Depth':>5}  {'Accuracy':>10}  {'Avg Exit Iter':>14}"
         print(header)
-        print(f"  {'-' * 5}  {'-' * 10}  {'-' * 14}  {'-' * 6}")
+        print(f"  {'-' * 5}  {'-' * 10}  {'-' * 14}")
         for d in sorted(acc.keys()):
-            split = "ID" if d <= 8 else "OOD"
             exit_str = f"{exit_iters[d]:.2f}" if d in exit_iters else "—"
-            print(f"  {d:>5}  {acc[d]:>10.4f}  {exit_str:>14}  {split:>6}")
+            print(f"  {d:>5}  {acc[d]:>10.4f}  {exit_str:>14}")
     else:
-        header = f"  {'Depth':>5}  {'Accuracy':>10}  {'Split':>6}"
+        header = f"  {'Depth':>5}  {'Accuracy':>10}"
         print(header)
-        print(f"  {'-' * 5}  {'-' * 10}  {'-' * 6}")
+        print(f"  {'-' * 5}  {'-' * 10}")
         for d in sorted(acc.keys()):
-            split = "ID" if d <= 8 else "OOD"
-            print(f"  {d:>5}  {acc[d]:>10.4f}  {split:>6}")
+            print(f"  {d:>5}  {acc[d]:>10.4f}")
 
-    # Overall averages
-    id_depths = [d for d in acc if d <= 8]
-    ood_depths = [d for d in acc if d > 8]
-    if id_depths:
-        id_avg = sum(acc[d] for d in id_depths) / len(id_depths)
-        print(f"\n  ID  avg (depths 1–8):   {id_avg:.4f}")
-    if ood_depths:
-        ood_avg = sum(acc[d] for d in ood_depths) / len(ood_depths)
-        print(f"  OOD avg (depths 9–16):  {ood_avg:.4f}")
-    all_avg = sum(acc.values()) / max(len(acc), 1)
-    print(f"  Overall avg:            {all_avg:.4f}")
+    if acc:
+        overall_avg = sum(acc.values()) / len(acc)
+        print(f"\n  Overall avg (depths {min(acc)}–{max(acc)}): {overall_avg:.4f}")
     print()
 
 
@@ -376,17 +366,9 @@ def save_summary(all_run_results: Dict[Tuple[str, int], Dict[str, Dict[int, Any]
                 }
             entry["avg_exit_iter_by_depth"] = exit_stats
 
-        # Convenience: overall ID/OOD means across seeds
-        id_means = [
-            v["mean"] for k, v in acc_stats.items() if int(k) <= 8
-        ]
-        ood_means = [
-            v["mean"] for k, v in acc_stats.items() if int(k) > 8
-        ]
-        if id_means:
-            entry["id_mean_acc"] = round(sum(id_means) / len(id_means), 6)
-        if ood_means:
-            entry["ood_mean_acc"] = round(sum(ood_means) / len(ood_means), 6)
+        all_means = [v["mean"] for v in acc_stats.values()]
+        if all_means:
+            entry["overall_mean_acc"] = round(sum(all_means) / len(all_means), 6)
 
         summary[variant] = entry
 
@@ -420,29 +402,26 @@ def print_summary_table(summary_path: Path) -> None:
         has_exit = "avg_exit_iter_by_depth" in entry
         if has_exit:
             exit_data = entry["avg_exit_iter_by_depth"]
-            print(f"  {'Depth':>5}  {'Acc Mean':>9}  {'± Std':>7}  {'Exit Mean':>10}  {'Split':>5}")
-            print(f"  {'-' * 5}  {'-' * 9}  {'-' * 7}  {'-' * 10}  {'-' * 5}")
+            print(f"  {'Depth':>5}  {'Acc Mean':>9}  {'± Std':>7}  {'Exit Mean':>10}")
+            print(f"  {'-' * 5}  {'-' * 9}  {'-' * 7}  {'-' * 10}")
         else:
-            print(f"  {'Depth':>5}  {'Acc Mean':>9}  {'± Std':>7}  {'Split':>5}")
-            print(f"  {'-' * 5}  {'-' * 9}  {'-' * 7}  {'-' * 5}")
+            print(f"  {'Depth':>5}  {'Acc Mean':>9}  {'± Std':>7}")
+            print(f"  {'-' * 5}  {'-' * 9}  {'-' * 7}")
 
         for d_str in sorted(acc.keys(), key=lambda x: int(x)):
             d = int(d_str)
-            split = "ID" if d <= 8 else "OOD"
             mean = acc[d_str]["mean"]
             std = acc[d_str]["std"]
             if has_exit and d_str in exit_data:
                 e_mean = exit_data[d_str]["mean"]
-                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}  {e_mean:>10.2f}  {split:>5}")
+                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}  {e_mean:>10.2f}")
             elif has_exit:
-                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}  {'—':>10}  {split:>5}")
+                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}  {'—':>10}")
             else:
-                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}  {split:>5}")
+                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}")
 
-        if "id_mean_acc" in entry:
-            print(f"  ID  avg:  {entry['id_mean_acc']:.4f}")
-        if "ood_mean_acc" in entry:
-            print(f"  OOD avg:  {entry['ood_mean_acc']:.4f}")
+        if "overall_mean_acc" in entry:
+            print(f"  Overall avg: {entry['overall_mean_acc']:.4f}")
 
     print()
 
@@ -451,40 +430,39 @@ def print_summary_table(summary_path: Path) -> None:
 # Evaluation runners
 # ---------------------------------------------------------------------------
 
-def build_test_loaders(device: torch.device) -> Tuple[DataLoader, DataLoader]:
-    """Build DataLoaders for test_id and test_ood splits."""
+def build_test_loaders(device: torch.device) -> List[Tuple[str, DataLoader]]:
+    """Build DataLoader(s) for the test set(s).
+
+    v3: prefers a single `test.jsonl` covering the full depth range.
+    Legacy v1/v2: falls back to `test_id.jsonl` + `test_ood.jsonl` split.
+    Returns a list of (label, loader) pairs.
+    """
+    pin = device.type == "cuda"
+
+    def _loader(path: Path) -> DataLoader:
+        return DataLoader(
+            BracketDataset(path),
+            batch_size=EVAL_BATCH_SIZE,
+            shuffle=False,
+            num_workers=0,
+            drop_last=False,
+            pin_memory=pin,
+        )
+
+    v3_path = DATA_DIR / "test.jsonl"
+    if v3_path.exists():
+        return [("test", _loader(v3_path))]
+
     id_path = DATA_DIR / "test_id.jsonl"
     ood_path = DATA_DIR / "test_ood.jsonl"
+    if id_path.exists() and ood_path.exists():
+        return [("test_id", _loader(id_path)), ("test_ood", _loader(ood_path))]
 
-    if not id_path.exists():
-        raise FileNotFoundError(
-            f"Test data not found at {id_path}\n"
-            f"  Run `python -m polly.data` first to generate splits."
-        )
-    if not ood_path.exists():
-        raise FileNotFoundError(
-            f"Test data not found at {ood_path}\n"
-            f"  Run `python -m polly.data` first to generate splits."
-        )
-
-    pin = device.type == "cuda"
-    id_loader = DataLoader(
-        BracketDataset(id_path),
-        batch_size=EVAL_BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-        drop_last=False,
-        pin_memory=pin,
+    raise FileNotFoundError(
+        f"No test data found in {DATA_DIR}. "
+        f"Expected `test.jsonl` (v3) or `test_id.jsonl`+`test_ood.jsonl` (v1/v2).\n"
+        f"  Run `python -m polly.data` first to generate splits."
     )
-    ood_loader = DataLoader(
-        BracketDataset(ood_path),
-        batch_size=EVAL_BATCH_SIZE,
-        shuffle=False,
-        num_workers=0,
-        drop_last=False,
-        pin_memory=pin,
-    )
-    return id_loader, ood_loader
 
 
 def evaluate_single_run(
@@ -497,25 +475,17 @@ def evaluate_single_run(
     print(f"\n[eval] Loading {variant} seed={seed} ...")
     model, meta = load_checkpoint(variant, seed, device)
 
-    id_loader, ood_loader = build_test_loaders(device)
+    loaders = build_test_loaders(device)
 
-    print(f"[eval] Evaluating on test_id (depths 1–8) ...")
-    id_results = evaluate_model(model, id_loader, device, force_all_iters=force_all_iters)
-
-    print(f"[eval] Evaluating on test_ood (depths 9–16) ...")
-    ood_results = evaluate_model(model, ood_loader, device, force_all_iters=force_all_iters)
-
-    # Merge the two result dicts (depths don't overlap so union is clean)
     combined: Dict[str, Dict[int, Any]] = {
-        "accuracy_by_depth": {
-            **id_results["accuracy_by_depth"],
-            **ood_results["accuracy_by_depth"],
-        },
-        "avg_exit_iter_by_depth": {
-            **id_results["avg_exit_iter_by_depth"],
-            **ood_results["avg_exit_iter_by_depth"],
-        },
+        "accuracy_by_depth": {},
+        "avg_exit_iter_by_depth": {},
     }
+    for label, loader in loaders:
+        print(f"[eval] Evaluating on {label} ...")
+        res = evaluate_model(model, loader, device, force_all_iters=force_all_iters)
+        combined["accuracy_by_depth"].update(res["accuracy_by_depth"])
+        combined["avg_exit_iter_by_depth"].update(res["avg_exit_iter_by_depth"])
 
     print_accuracy_table(variant, seed, combined, meta)
     save_run_results(variant, seed, combined, force_all_iters)

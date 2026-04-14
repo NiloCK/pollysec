@@ -56,7 +56,7 @@ TOKEN_MAP: Dict[str, int] = {
     "}": CLOSE_BRACE,
 }
 
-MAX_SEQ_LEN = 34  # 1 CLS + up to 32 bracket chars + at least 1 PAD
+MAX_SEQ_LEN = 66  # 1 CLS + up to 2*30 bracket chars + at least 1 PAD (depth 30)
 
 
 # ── Validation helpers ────────────────────────────────────────────────────────
@@ -487,30 +487,28 @@ def print_summary(name: str, examples: List[Dict[str, Any]],
 def main() -> None:
     data_dir = Path(__file__).resolve().parent / "data"
 
+    # v3: single depth range covering 1..30 — train/val/test all sample from
+    # the same distribution. Per-depth accuracy on test is the experimental
+    # signal (see todo-v3.md). Sizes chosen so per_depth is even at every depth.
+    depths = list(range(1, 31))  # 30 depths
     splits = {
         "train": {
-            "depths": list(range(1, 9)),
-            "total_size": 200_000,
+            "depths": depths,
+            "total_size": 210_000,   # 7000 per depth
             "seed": 42,
             "filename": "train.jsonl",
         },
         "val": {
-            "depths": list(range(1, 9)),
-            "total_size": 10_000,
+            "depths": depths,
+            "total_size": 15_000,    # 500 per depth
             "seed": 43,
             "filename": "val.jsonl",
         },
-        "test_id": {
-            "depths": list(range(1, 9)),
-            "total_size": 10_000,
+        "test": {
+            "depths": depths,
+            "total_size": 15_000,    # 500 per depth
             "seed": 44,
-            "filename": "test_id.jsonl",
-        },
-        "test_ood": {
-            "depths": list(range(9, 17)),
-            "total_size": 10_000,
-            "seed": 45,
-            "filename": "test_ood.jsonl",
+            "filename": "test.jsonl",
         },
     }
 
@@ -525,7 +523,7 @@ def main() -> None:
         # ── Final validation pass ────────────────────────────────────
         for ex in examples:
             s = ex["input"]
-            assert len(s) <= 32, f"String too long ({len(s)}): {s!r}"
+            assert len(s) <= MAX_SEQ_LEN - 2, f"String too long ({len(s)}): {s!r}"
             # Check all chars are valid brackets
             assert all(ch in TOKEN_MAP for ch in s), f"Invalid chars in: {s!r}"
             if ex["label"] == 1:

@@ -1,5 +1,20 @@
 # Polly v2 — Multi-Type Brackets TODO
 
+> # ⚠️ DEPRECATED — 2026-04-14
+> #
+> # Superseded by [`todo-v3.md`](./todo-v3.md).
+> #
+> # v2 multi-type pivot did not make the task hard enough: vanilla hit 100%
+> # on both IID (depths 1–8) *and* OOD (depths 9–16) after ~3k steps, and
+> # looped's exit gate never fired. The IID/OOD framing also introduces a
+> # position-embedding extrapolation confound that would muddy any
+> # depth-ceiling result. See `todo-v3.md` for the single-range
+> # depth-curve redesign (train + test share depths 1..D_max; per-depth
+> # accuracy is the signal).
+> #
+> # Phase A records below remain accurate as historical state. Phases B/C
+> # are obsolete — do not work from them.
+
 > New track supplementing `todo.md`. Spawned 2026-04-14 after v1 results.
 > Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked/decision needed
 

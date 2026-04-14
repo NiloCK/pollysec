@@ -50,34 +50,35 @@ test set is the experimental signal — a curve, not a scalar.
 
 ## Phase A — Task redesign (single-range)
 
-- [ ] **A.1** Collapse data splits
-  - [ ] `polly/data.py`: one `depths = range(1, D_max + 1)` shared by
-        train / val / test. Drop the `test_ood` split entirely (archive the
-        file alongside v1 if desired).
-  - [ ] Start with `D_max = 30`. Bump if vanilla still saturates.
-  - [ ] Sizes: train 200k, val 10k, test 15k (500/depth × 30 depths).
-  - [ ] Per-depth class balance (50% balanced / 50% unbalanced) preserved.
-  - [ ] Keep the same corruption-type mix from v2 (mismatch-heavy).
+- [x] **A.1** Collapse data splits
+  - [x] `polly/data.py`: one `depths = range(1, 31)` shared by
+        train / val / test. `test_ood` dropped.
+  - [x] `D_max = 30`. Train 210k (7000/depth), val 15k (500/depth),
+        test 15k (500/depth). Per-depth class balance + mismatch-heavy
+        corruption retained from v2.
+        Mismatch sanity: 4860/4860 mismatch corruptions pass the counter
+        test and fail the stack test (as intended).
 
-- [ ] **A.2** Bump sequence length
-  - [ ] `MAX_SEQ_LEN = 66` in both `polly/data.py` and `polly/model.py`
-        (1 CLS + 2·30 bracket chars + ≥1 PAD).
-  - [ ] Sanity check: `generate_balanced(30, rng)` produces strings of
-        length ≤ 65.
+- [x] **A.2** Bump sequence length
+  - [x] `MAX_SEQ_LEN = 66` in both `polly/data.py` and `polly/model.py`.
+  - [x] Sanity check: depth-30 string has len 60 ≤ 64 (MAX-2 after
+        CLS+PAD). Final-pass assert updated to `len(s) <= MAX_SEQ_LEN - 2`.
 
-- [ ] **A.3** Update `evaluate.py`
-  - [ ] Drop ID/OOD split reporting. One test set, per-depth accuracy
-        table + curve.
-  - [ ] Graceful fallback if legacy `test_id.jsonl` / `test_ood.jsonl`
-        exist (v1/v2 checkpoints).
+- [x] **A.3** Update `evaluate.py`
+  - [x] `build_test_loaders` prefers v3 `test.jsonl`; falls back to
+        v1/v2 `test_id.jsonl` + `test_ood.jsonl`.
+  - [x] Dropped ID/OOD split in both single-run table and `--all` aggregation.
+        Replaced `id_mean_acc`/`ood_mean_acc` with single `overall_mean_acc`.
 
-- [ ] **A.4** Archive v2 data under `polly/data/v2/` (like v1 is now).
+- [x] **A.4** v2 data archived under `polly/data/v2/`; v3 splits live at
+      `polly/data/{train,val,test}.jsonl`.
 
 ---
 
 ## Phase B — Training
 
-- [ ] **B.1** Pilot: 3k steps, vanilla + looped, one seed, `D_max = 30`.
+- [~] **B.1** Pilot: 3k steps, vanilla + looped, one seed, `D_max = 30`.
+      Ready to run on Kaggle — see "How to retrain on Kaggle" below.
   Goal: observe where (if anywhere) vanilla's per-depth accuracy starts to
   dip. Outcomes:
   - Vanilla saturates at 1.0 everywhere → bump `D_max` to 45, rerun pilot.

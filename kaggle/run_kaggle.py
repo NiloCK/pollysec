@@ -45,10 +45,10 @@ os.chdir(REPO_DIR)
 PILOT = True
 
 if PILOT:
-    # Per todo-v2 §B.1: short pilot to find a sensible step budget.
+    # Per todo-v3 §B.1: short pilot on the single-range depth-30 task.
     VARIANTS = ["vanilla", "looped"]
     SEEDS = [100]
-    STEPS = 5_000
+    STEPS = 3_000
 else:
     VARIANTS = ["vanilla", "vanilla_reg", "looped", "looped_reg"]
     SEEDS = [100, 200, 300]

@@ -33,10 +33,26 @@ WORK_DIR = "/kaggle/working"
 
 # Route checkpoints/logs to the writable kernel workspace BEFORE importing polly.
 os.environ["POLLY_CHECKPOINT_DIR"] = os.path.join(WORK_DIR, "checkpoints")
-os.environ["POLLY_DATA_DIR"] = os.path.join(REPO_DIR, "polly", "data")
+os.environ["POLLY_DATA_DIR"] = os.path.join(REPO_DIR, "data")
 
-sys.path.insert(0, REPO_DIR)
-os.chdir(REPO_DIR)
+print(f"[diag] REPO_DIR contents:")
+for root, dirs, files in os.walk(REPO_DIR):
+    depth = root.replace(REPO_DIR, "").count(os.sep)
+    if depth > 2:
+        continue
+    indent = "  " * depth
+    print(f"[diag] {indent}{os.path.basename(root) or root}/")
+    for f in files[:5]:
+        print(f"[diag] {indent}  {f}")
+
+# The staged dataset landed polly/'s contents at the root of REPO_DIR
+# (no wrapping polly/ dir, due to kaggle's --dir-mode zip flattening).
+# Re-expose it as an importable `polly` package via a symlink in /kaggle/working.
+pkg_link = os.path.join(WORK_DIR, "polly")
+if not os.path.exists(pkg_link):
+    os.symlink(REPO_DIR, pkg_link)
+sys.path.insert(0, WORK_DIR)
+os.chdir(WORK_DIR)
 
 # ---------------------------------------------------------------------------
 # Run config — edit these before `kaggle kernels push`

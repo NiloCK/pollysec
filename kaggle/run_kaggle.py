@@ -64,7 +64,7 @@ if PILOT:
     # Per todo-v3 §B.1: short pilot on the single-range depth-30 task.
     VARIANTS = ["vanilla", "looped"]
     SEEDS = [100]
-    STEPS = 3_000
+    STEPS = 10_000
 else:
     VARIANTS = ["vanilla", "vanilla_reg", "looped", "looped_reg"]
     SEEDS = [100, 200, 300]

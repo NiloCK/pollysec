@@ -61,12 +61,14 @@ os.chdir(WORK_DIR)
 PILOT = True
 
 if PILOT:
-    # Per todo-v3 §B.1: short pilot on the single-range depth-30 task.
-    VARIANTS = ["vanilla", "looped"]
+    # v4 §C.1 — vanilla baseline + scaffolded looped_reg on ListOps.
+    # Bare `looped` (bitter-lesson test) deferred to C.2 pending C.1 results.
+    VARIANTS = ["vanilla", "looped_reg"]
     SEEDS = [100]
     STEPS = 10_000
 else:
-    VARIANTS = ["vanilla", "vanilla_reg", "looped", "looped_reg"]
+    # v4 §C.3 — full sweep. `vanilla_reg` dropped under scaffolding reframe.
+    VARIANTS = ["vanilla", "looped", "looped_reg"]
     SEEDS = [100, 200, 300]
     STEPS = 30_000
 

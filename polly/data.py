@@ -41,7 +41,7 @@ PAD = 0
 CLS = 17
 
 VOCAB_SIZE = 18
-MAX_SEQ_LEN = 128
+MAX_SEQ_LEN = 256  # bumped from 128 to lift DG-1 length cap on d≥5 trees
 
 # Token map: string token → integer ID
 TOKEN_MAP: Dict[str, int] = {
@@ -173,7 +173,7 @@ def _parse_tokens(tokens: List[str], pos: int) -> Tuple[Expr, int]:
 # ── Expression generation ────────────────────────────────────────────────────
 
 def generate_expression(target_depth: int, rng: random.Random,
-                        a_max: int = 5, max_tokens: int = 120) -> Optional[Expr]:
+                        a_max: int = 5, max_tokens: int = 248) -> Optional[Expr]:
     """Generate an expression with exactly `target_depth` as max nesting depth.
 
     Strategy:
@@ -297,7 +297,7 @@ def _gen(target_depth: int, remaining_depth: int, rng: random.Random,
 # ── Split generation ─────────────────────────────────────────────────────────
 
 def generate_split(depths: List[int], total_size: int, seed: int,
-                   a_max: int = 5, max_tokens: int = 120) -> List[Dict[str, Any]]:
+                   a_max: int = 5, max_tokens: int = 248) -> List[Dict[str, Any]]:
     """Generate a balanced split of ListOps examples.
 
     Generates ~2× the needed count per (depth, label) bucket, then subsamples
@@ -526,13 +526,10 @@ def main() -> None:
         "test":  {"total_size": 18_000,  "seed": 44, "filename": "test.jsonl"},
     }
 
-    max_tokens = MAX_SEQ_LEN - 2  # leave room for CLS + at least 1 PAD → 126
-    # Actually we want expressions to fit with CLS prepended and still be < 128.
-    # CLS takes 1 slot, expression takes `length` slots, rest is PAD.
-    # So expression can be at most MAX_SEQ_LEN - 1 = 127 tokens.
-    # But we want at least 1 PAD, so max_tokens = MAX_SEQ_LEN - 2 = 126.
-    # Spec says max_tokens=120 as a comfortable margin. Use that.
-    max_tokens = 120
+    # Budget = MAX_SEQ_LEN - 2 (CLS + ≥1 PAD). With MAX_SEQ_LEN=256 this gives
+    # 254; use 248 for a comfortable margin. DG-1 fix: 120 was too tight and
+    # capped d≥5 expressions, making them simpler than d=4. See results/runs.md.
+    max_tokens = 248
 
     print("ListOps data generation")
     print(f"  D_max={d_max}, A_max={a_max}, depths={depths}")

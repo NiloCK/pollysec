@@ -146,7 +146,7 @@ VARIANTS = {"vanilla", "looped", "looped_reg"}
 
 # Hyperparameters
 VOCAB_SIZE = 18      # PAD=0, digits 0-9 (1-10), MIN=11, MAX=12, MED=13, SM=14, [=15, ]=16, CLS=17
-MAX_SEQ_LEN = 128    # budget for ListOps expressions (D_max=6, A_max=5)
+MAX_SEQ_LEN = 256    # budget for ListOps expressions; bumped from 128 to lift DG-1
 DIM = 64
 N_HEADS = 4
 FFN_DIM = 256

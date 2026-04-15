@@ -87,17 +87,34 @@ for d in range(1, 46):
 done
 ```
 
-### Probing + ablation
+### Probing + ablation (register-specific, `looped_reg` only)
+
+Both scripts are hard-targeted at the `looped_reg` variant — they exist to
+interrogate the cross-iteration **register vector**, which only that variant
+has. They assume a trained `looped_reg_seed{N}/best.pt` checkpoint exists.
+Neither takes a `--variant` flag.
 
 ```bash
-# Activation probes — does the register encode depth / iteration count?
-python -m polly.probe --variant looped_reg --seed 100
+# Linear probes on the register: does r encode iteration #, nesting depth,
+# or the final answer? Also probes CLS hidden state for comparison.
+python -m polly.probe --seed 100 --device cpu
 
-# Head / register ablations — what breaks generalisation?
-python -m polly.ablate --variant looped_reg --seed 100
+# Causal ablations on the register between iterations:
+#   (1) zero r after each iter   (2) freeze r to its iter-1 value
+#   (3) inject Gaussian noise into r
+python -m polly.ablate --seed 100 --device cpu
 ```
 
-Both are `POLLY_CHECKPOINT_DIR`-aware.
+Neither script is meaningful for `vanilla`, `vanilla_reg`, or `looped` —
+they don't maintain a cross-iteration register state to probe or ablate.
+If you want comparable diagnostics for non-register variants, that's a
+separate build (e.g. probing CLS-hidden across iterations for `looped`).
+Both scripts are `POLLY_CHECKPOINT_DIR`-aware.
+
+> **v3 heads-up:** these scripts predate the v3 depth-range expansion
+> (d=60) and the Phase E PonderNet loss. They should still run against v3
+> checkpoints but may hardcode depth ranges (e.g. 1–16) in their probe
+> targets — worth skimming before trusting the output.
 
 ### Heads-up on checkpoint compatibility
 

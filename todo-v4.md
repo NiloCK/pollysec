@@ -1,5 +1,30 @@
 # Polly v4 — ListOps, and a Reframe of What the Register Is For
 
+> **DEPRECATED 2026-04-15 — superseded by `todo-v5.md`.**
+>
+> **Postmortem.** Phase A (ListOps migration) and Phase B (training-stability
+> instrumentation + loss retune) both landed successfully. Phase C.1 pilot
+> (vanilla + looped_reg × seed 100 × 10k steps) *ran* — see `results/runs.md`
+> — but exposed a structural problem loss tuning can't reach.
+>
+> Under ponder loss (λ_p=0.05, β warmup), looped_reg hit val_acc 0.25 (vs
+> vanilla 0.45) with per-iter CE monotonically *worsening* across iterations
+> and exit_dist collapsed to iter 1. Under uniform loss it matched vanilla
+> (0.452) but per-iter CE collapsed to identity — tied-weight stack found
+> the trivial fixed-point. Root cause: the residual stream at layer 6 has to
+> be simultaneously "decodable by the output head" and "re-encodable by layer
+> 1 of iter t+1," which is a contradiction in what layer weights are for.
+> v5 fixes this architecturally by splitting encoder / interpreter / decoder.
+>
+> Also flagged during Phase C: **DG-1** — the ListOps generator's length cap
+> made d≥5 expressions structurally simpler than d=4, inverting the expected
+> depth curve. Fixed locally (`MAX_SEQ_LEN = 256`, `max_tokens = 248`); data
+> regenerated. v5 C.1 runs pick up against the well-formed data.
+>
+> Phase D/E plans carry forward into v5 largely unchanged.
+>
+> ---
+>
 > Supersedes `todo-v3.md`. Spawned 2026-04-15 after v3 bracket runs saturated
 > vanilla and failed to train any looped variant.
 > Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked/decision needed

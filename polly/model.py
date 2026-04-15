@@ -1,11 +1,14 @@
 """
-Bracket-matching transformer — four variants in one class.
+Polly transformer — three model variants for ListOps experiments.
 
 Variants (controlled by `variant` parameter):
-  "vanilla"      — V1: standard 6-layer transformer, single pass
-  "vanilla_reg"  — V2: 6-layer transformer + register mechanism
-  "looped"       — V3: 6 weight-tied layers applied T times, with exit gate
-  "looped_reg"   — V4: looped + register mechanism carried across iterations
+  "vanilla"      — Standard 6-layer transformer, single pass (baseline)
+  "looped"       — 6 weight-tied layers applied T times, with exit gate
+  "looped_reg"   — Looped + register mechanism carried across iterations
+
+Dropped in v4: "vanilla_reg" — not scientifically interesting under the
+scaffolding reframe (registers without looping have no cross-iteration
+state to scaffold).
 """
 
 from __future__ import annotations
@@ -99,7 +102,7 @@ class TransformerLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Register mechanism (used by vanilla_reg and looped_reg)
+# Register mechanism (used by looped_reg)
 # ---------------------------------------------------------------------------
 
 class RegisterMechanism(nn.Module):
@@ -107,6 +110,11 @@ class RegisterMechanism(nn.Module):
     Maintains a register vector r ∈ ℝ^reg_dim that is:
       • *injected* into the hidden states before each transformer layer
       • *updated* from (h_cls, r) after each transformer layer
+
+    The register is a dedicated low-resistance channel for cross-iteration
+    state. Under the v4 reframe, it scaffolds recursive control flow —
+    the scientific claim rests on probing evidence (D.2), not on
+    architectural exclusivity.
     """
 
     def __init__(self, hidden_dim: int = 64, reg_dim: int = 8, mlp_mid: int = 32):
@@ -134,27 +142,30 @@ class RegisterMechanism(nn.Module):
 # Main model
 # ---------------------------------------------------------------------------
 
-VARIANTS = {"vanilla", "vanilla_reg", "looped", "looped_reg"}
+VARIANTS = {"vanilla", "looped", "looped_reg"}
 
-# Hyperparameters (fixed by spec)
-VOCAB_SIZE = 8       # PAD=0, (=1, )=2, [=3, ]=4, {=5, }=6, CLS=7
-MAX_SEQ_LEN = 128    # 1 CLS + up to 2*60 bracket chars + padding (depth 60)
+# Hyperparameters
+VOCAB_SIZE = 18      # PAD=0, digits 0-9 (1-10), MIN=11, MAX=12, MED=13, SM=14, [=15, ]=16, CLS=17
+MAX_SEQ_LEN = 128    # budget for ListOps expressions (D_max=6, A_max=5)
 DIM = 64
 N_HEADS = 4
 FFN_DIM = 256
 N_LAYERS = 6
 REG_DIM = 8
-NUM_CLASSES = 2      # [unbalanced, balanced]
+NUM_CLASSES = 10     # ListOps output: single digit 0-9
 
 
-class BracketTransformer(nn.Module):
+class PollyTransformer(nn.Module):
     """
-    Unified bracket-matching transformer supporting four variants.
+    Unified transformer for ListOps, supporting three variants:
+      - vanilla:    standard 6-layer, single pass (baseline)
+      - looped:     6 weight-tied layers × T iterations, exit gate
+      - looped_reg: looped + cross-iteration register mechanism
 
     Forward returns a dict:
-        logits          — list of (B, 2) tensors, one per iteration
-        exit_probs      — list of (B,) tensors (empty for non-looped)
-        register_states — list of (B, reg_dim) tensors (empty for non-register)
+        logits          — list of (B, NUM_CLASSES) tensors, one per iteration
+        exit_probs      — list of (B,) tensors (empty for vanilla)
+        register_states — list of (B, REG_DIM) tensors (empty for vanilla/looped)
     """
 
     def __init__(self, variant: str = "vanilla"):
@@ -162,7 +173,7 @@ class BracketTransformer(nn.Module):
         if variant not in VARIANTS:
             raise ValueError(f"Unknown variant {variant!r}. Choose from {VARIANTS}.")
         self.variant = variant
-        self.has_register = variant in ("vanilla_reg", "looped_reg")
+        self.has_register = variant == "looped_reg"
         self.is_looped = variant in ("looped", "looped_reg")
 
         # ---- embeddings ----
@@ -180,11 +191,11 @@ class BracketTransformer(nn.Module):
         self.out_norm = RMSNorm(DIM)
         self.out_head = nn.Linear(DIM, NUM_CLASSES, bias=False)
 
-        # ---- register (V2, V4) ----
+        # ---- register (looped_reg only) ----
         if self.has_register:
             self.register_mech = RegisterMechanism(hidden_dim=DIM, reg_dim=REG_DIM)
 
-        # ---- exit gate (V3, V4) ----
+        # ---- exit gate (looped, looped_reg) ----
         if self.is_looped:
             self.exit_gate = nn.Linear(DIM, 1, bias=True)
 
@@ -204,9 +215,13 @@ class BracketTransformer(nn.Module):
             elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
 
-        # Exit-gate init: neutral (sigmoid(0) = 0.5). Under PonderNet-style loss
-        # the KL to a geometric prior shapes the exit distribution; no need to
-        # bias against exiting at init.
+        # Exit-gate init: neutral (sigmoid(0) = 0.5). Under PonderNet-style
+        # loss the KL to a geometric prior shapes the exit distribution.
+        # NOTE (B.3 audit): with weight=0, bias=0, init exit prob is 0.5 at
+        # every iteration, yielding a geometric-decaying exit_dist that
+        # front-loads mass on iter 1. Combined with a front-loaded prior
+        # (λ_p=0.3), this was identified as the primary cause of v3's
+        # exit-collapse. Fix applied in train.py: β-warmup and smaller λ_p.
         if self.is_looped:
             nn.init.zeros_(self.exit_gate.weight)
             nn.init.zeros_(self.exit_gate.bias)
@@ -249,7 +264,7 @@ class BracketTransformer(nn.Module):
         return h, r, reg_snapshots
 
     def _compute_logits(self, h: torch.Tensor) -> torch.Tensor:
-        """Output head: RMSNorm on CLS hidden → linear → (B, 2)."""
+        """Output head: RMSNorm on CLS hidden → linear → (B, NUM_CLASSES)."""
         cls_h = h[:, 0, :]  # (B, D)
         return self.out_head(self.out_norm(cls_h))
 
@@ -277,9 +292,9 @@ class BracketTransformer(nn.Module):
             exit_threshold: p_exit threshold for early stopping at eval time.
 
         Returns dict with keys:
-            logits          — list[Tensor(B,2)]  one per iteration
-            exit_probs      — list[Tensor(B,)]   one per iteration (empty for non-looped)
-            register_states — list[Tensor(B,8)]   one per iteration (empty for non-register)
+            logits          — list[Tensor(B, 10)]  one per iteration
+            exit_probs      — list[Tensor(B,)]     one per iteration (empty for vanilla)
+            register_states — list[Tensor(B, 8)]    one per iteration (empty for vanilla/looped)
         """
         B = input_ids.size(0)
         device = input_ids.device
@@ -296,20 +311,15 @@ class BracketTransformer(nn.Module):
         all_register_states: list[torch.Tensor] = []
 
         if not self.is_looped:
-            # -------- single-pass variants (vanilla, vanilla_reg) --------
+            # -------- single-pass variant (vanilla) --------
             h, r, _ = self._run_layers(h, attention_mask, r)
             all_logits.append(self._compute_logits(h))
-            if self.has_register:
-                assert r is not None
-                all_register_states.append(r)
         else:
             # -------- looped variants (looped, looped_reg) --------
-            # All T iterations compute at both train and eval. Per-sample
-            # exit selection happens downstream (evaluate.py picks logits
-            # from each sample's exit iter, which is the first t where the
-            # cumulative exit probability crosses `exit_threshold`, else T-1).
-            # This keeps forward batched and avoids ragged shapes; wall-clock
-            # inference savings via per-sample masking is a later optimisation.
+            # All T iterations always compute. Per-sample exit selection
+            # happens downstream (evaluate.py picks logits from each
+            # sample's exit iter). This keeps forward batched and avoids
+            # ragged shapes.
             for t in range(t_max):
                 h, r, _ = self._run_layers(h, attention_mask, r)
 
@@ -337,5 +347,12 @@ class BracketTransformer(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"variant={self.variant!r}, dim={DIM}, layers={N_LAYERS}, "
-            f"heads={N_HEADS}, params={self.count_parameters():,}"
+            f"heads={N_HEADS}, num_classes={NUM_CLASSES}, "
+            f"params={self.count_parameters():,}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat alias (references in older scripts)
+# ---------------------------------------------------------------------------
+BracketTransformer = PollyTransformer

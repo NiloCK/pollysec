@@ -1,9 +1,9 @@
 """
-polly.evaluate — Evaluation script for bracket-matching transformer experiments.
+polly.evaluate — Evaluation script for ListOps transformer experiments (v4).
 
-Computes per-depth accuracy on in-distribution (depths 1-8) and out-of-distribution
-(depths 9-16) test sets.  For looped variants, also tracks average exit iteration
-per depth.
+Computes per-depth accuracy (depths 1–D_max) and per-root-operation accuracy
+on a single unified test set.  For looped variants, also tracks average exit
+iteration per depth.
 
 Usage:
     # Single run:
@@ -12,7 +12,7 @@ Usage:
     # Single run, forcing all iterations (no early exit) for looped variants:
     python -m polly.evaluate --variant looped --seed 100 --force-all-iters
 
-    # All runs (4 variants × 3 seeds), with aggregated summary:
+    # All runs (3 variants × 3 seeds), with aggregated summary:
     python -m polly.evaluate --all --device auto
 """
 
@@ -21,25 +21,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from polly.data import BracketDataset
-from polly.model import BracketTransformer
+from polly.data import ListOpsDataset, read_jsonl
+from polly.model import PollyTransformer
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-VARIANTS = ("vanilla", "vanilla_reg", "looped", "looped_reg")
+VARIANTS = ("vanilla", "looped", "looped_reg")
 LOOPED_VARIANTS = ("looped", "looped_reg")
 SEEDS = (100, 200, 300)
+NUM_CLASSES = 10
+ROOT_OPS = ("MIN", "MAX", "MED", "SM")
 
 EVAL_BATCH_SIZE = 256
 DEFAULT_T_MAX = 4
@@ -51,13 +51,32 @@ FIGURES_DIR = Path(os.environ.get("POLLY_FIGURES_DIR", Path(__file__).resolve().
 
 
 # ---------------------------------------------------------------------------
-# Device helper
+# Helpers
 # ---------------------------------------------------------------------------
 
 def resolve_device(device_str: str) -> torch.device:
     if device_str == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return torch.device(device_str)
+
+
+def extract_root_op(input_str: str) -> str:
+    """Extract the root operation from a ListOps input string.
+
+    The root op is the first token after the opening '['.
+    Example: "[ SM 3 [ MIN 4 1 ] ]" → "SM"
+    """
+    tokens = input_str.split()
+    # tokens[0] should be '[', tokens[1] is the root op
+    if len(tokens) >= 2:
+        return tokens[1]
+    return "UNKNOWN"
+
+
+def _load_test_inputs(path: Path) -> List[str]:
+    """Load raw input strings from the test JSONL so we can extract root ops."""
+    examples = read_jsonl(path)
+    return [ex["input"] for ex in examples]
 
 
 # ---------------------------------------------------------------------------
@@ -68,7 +87,7 @@ def load_checkpoint(
     variant: str,
     seed: int,
     device: torch.device,
-) -> Tuple[BracketTransformer, Dict[str, Any]]:
+) -> Tuple[PollyTransformer, Dict[str, Any]]:
     """Load a trained model from its best checkpoint.
 
     Returns (model, checkpoint_metadata).
@@ -82,7 +101,7 @@ def load_checkpoint(
 
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
-    model = BracketTransformer(variant=variant)
+    model = PollyTransformer(variant=variant)
     model.load_state_dict(ckpt["model_state_dict"])
     model = model.to(device)
     model.eval()
@@ -100,26 +119,46 @@ def load_checkpoint(
 # ---------------------------------------------------------------------------
 
 def evaluate_model(
-    model: BracketTransformer,
+    model: PollyTransformer,
     test_loader: DataLoader,
     device: torch.device,
     force_all_iters: bool = False,
-) -> Dict[str, Dict[int, Any]]:
+    root_ops: Optional[List[str]] = None,
+) -> Dict[str, Any]:
     """Run evaluation on a single DataLoader.
 
+    Args:
+        model:           trained PollyTransformer
+        test_loader:     DataLoader yielding (input_ids, attention_mask, label, depth)
+        device:          torch device
+        force_all_iters: if True, run all t_max iterations (no early exit)
+        root_ops:        list of root operation strings, one per sample in
+                         dataset order.  If None, per-op breakdown is skipped.
+
     Returns a dict with:
-        "accuracy_by_depth" : {depth: float}
-        "avg_exit_iter_by_depth" : {depth: float}   (only for looped variants)
+        "accuracy_by_depth"       : {depth: float}
+        "accuracy_by_op"          : {op: float}
+        "avg_exit_iter_by_depth"  : {depth: float}   (only for looped variants)
+        "overall_accuracy"        : float
     """
     model.eval()
 
     depth_correct: Dict[int, int] = defaultdict(int)
     depth_total: Dict[int, int] = defaultdict(int)
-    # For looped variants: track exit iteration per sample
+
+    op_correct: Dict[str, int] = defaultdict(int)
+    op_total: Dict[str, int] = defaultdict(int)
+
     depth_exit_iter_sum: Dict[int, float] = defaultdict(float)
     depth_exit_iter_count: Dict[int, int] = defaultdict(int)
 
+    total_correct = 0
+    total_samples = 0
+
     is_looped = model.is_looped
+
+    # Track global sample index to map back to root_ops list
+    sample_idx = 0
 
     with torch.no_grad():
         for batch in test_loader:
@@ -129,7 +168,6 @@ def evaluate_model(
             depths = batch[3]  # keep on CPU for bookkeeping
 
             if is_looped and force_all_iters:
-                # Force all iterations — set threshold impossibly high
                 outputs = model(
                     input_ids,
                     attention_mask,
@@ -149,40 +187,28 @@ def evaluate_model(
 
             B = labels.shape[0]
 
-            # Default: use last iteration's logits (non-looped, or force_all_iters).
+            # Default: use last iteration's logits
             logits = logits_list[-1]
 
             # ------- per-sample exit iteration (looped only) -------
-            # The model does batch-level early exit: it stops when ALL
-            # samples want to exit.  So len(logits_list) tells us
-            # when the batch stopped, but per-sample we can do better
-            # by looking at which iteration each sample first crossed
-            # the exit threshold.
             per_sample_exit_iter: Optional[torch.Tensor] = None
             if is_looped and exit_probs_list:
-                # Shape: (T, B)
                 exit_probs_stack = torch.stack(exit_probs_list, dim=0)  # (T, B)
                 T = exit_probs_stack.shape[0]
 
                 if not force_all_iters:
-                    # Find per-sample first iteration where exit_prob > threshold
                     exceeded = exit_probs_stack > DEFAULT_EXIT_THRESHOLD  # (T, B)
-                    # For each sample, find the first True along dim 0.
-                    # If never exceeded, use the last iteration T.
-                    # iters are 1-indexed (iteration 1 = first pass through layers)
                     per_sample_exit_iter = torch.full((B,), T, dtype=torch.float32)
                     for t_idx in range(T):
                         still_running = per_sample_exit_iter == T
                         newly_exiting = exceeded[t_idx] & still_running
                         per_sample_exit_iter[newly_exiting] = float(t_idx + 1)
                 else:
-                    # When forcing all iters, report the actual number of
-                    # iterations run (all T) for every sample.
                     per_sample_exit_iter = torch.full((B,), float(T), dtype=torch.float32)
 
-                # Gather per-sample logits from each sample's exit iteration.
+                # Gather per-sample logits from each sample's exit iteration
                 if not force_all_iters:
-                    logits_stack = torch.stack(logits_list, dim=0)           # (T, B, C)
+                    logits_stack = torch.stack(logits_list, dim=0)  # (T, B, C)
                     exit_idx = (per_sample_exit_iter.long() - 1).clamp(min=0, max=T - 1)
                     exit_idx = exit_idx.to(logits_stack.device)
                     logits = logits_stack[exit_idx, torch.arange(B, device=logits_stack.device)]
@@ -190,20 +216,38 @@ def evaluate_model(
             preds = logits.argmax(dim=-1)
             correct = (preds == labels)
 
-            # ------- accumulate per-depth stats -------
+            # ------- accumulate stats -------
             for i in range(B):
                 d = depths[i].item()
+                c = int(correct[i].item())
+
                 depth_total[d] += 1
-                depth_correct[d] += int(correct[i].item())
+                depth_correct[d] += c
+
+                total_correct += c
+                total_samples += 1
+
+                # Per-op breakdown
+                if root_ops is not None and sample_idx + i < len(root_ops):
+                    op = root_ops[sample_idx + i]
+                    op_total[op] += 1
+                    op_correct[op] += c
 
                 if per_sample_exit_iter is not None:
                     depth_exit_iter_sum[d] += per_sample_exit_iter[i].item()
                     depth_exit_iter_count[d] += 1
 
+            sample_idx += B
+
     # ------- compute final metrics -------
     accuracy_by_depth: Dict[int, float] = {}
     for d in sorted(depth_total.keys()):
         accuracy_by_depth[d] = depth_correct[d] / max(depth_total[d], 1)
+
+    accuracy_by_op: Dict[str, float] = {}
+    for op in ROOT_OPS:
+        if op_total[op] > 0:
+            accuracy_by_op[op] = op_correct[op] / op_total[op]
 
     avg_exit_iter_by_depth: Dict[int, float] = {}
     if is_looped:
@@ -212,9 +256,13 @@ def evaluate_model(
             if count > 0:
                 avg_exit_iter_by_depth[d] = depth_exit_iter_sum[d] / count
 
+    overall_accuracy = total_correct / max(total_samples, 1)
+
     return {
         "accuracy_by_depth": accuracy_by_depth,
+        "accuracy_by_op": accuracy_by_op,
         "avg_exit_iter_by_depth": avg_exit_iter_by_depth,
+        "overall_accuracy": overall_accuracy,
     }
 
 
@@ -225,12 +273,14 @@ def evaluate_model(
 def print_accuracy_table(
     variant: str,
     seed: int,
-    results: Dict[str, Dict[int, Any]],
+    results: Dict[str, Any],
     meta: Dict[str, Any],
 ) -> None:
-    """Print a nicely formatted table to stdout."""
+    """Print nicely formatted per-depth and per-op tables to stdout."""
     acc = results["accuracy_by_depth"]
     exit_iters = results.get("avg_exit_iter_by_depth", {})
+    acc_by_op = results.get("accuracy_by_op", {})
+    overall = results.get("overall_accuracy", 0.0)
     is_looped = variant in LOOPED_VARIANTS
 
     print()
@@ -240,6 +290,8 @@ def print_accuracy_table(
           f"val_acc={meta.get('best_val_acc', '?')}")
     print("=" * 72)
 
+    # ---- Per-depth table ----
+    print("\n  Per-Depth Accuracy:")
     if is_looped:
         header = f"  {'Depth':>5}  {'Accuracy':>10}  {'Avg Exit Iter':>14}"
         print(header)
@@ -254,9 +306,16 @@ def print_accuracy_table(
         for d in sorted(acc.keys()):
             print(f"  {d:>5}  {acc[d]:>10.4f}")
 
-    if acc:
-        overall_avg = sum(acc.values()) / len(acc)
-        print(f"\n  Overall avg (depths {min(acc)}–{max(acc)}): {overall_avg:.4f}")
+    # ---- Per-op table ----
+    if acc_by_op:
+        print("\n  Per-Operation Accuracy:")
+        print(f"  {'Op':>5}  {'Accuracy':>10}")
+        print(f"  {'-' * 5}  {'-' * 10}")
+        for op in ROOT_OPS:
+            if op in acc_by_op:
+                print(f"  {op:>5}  {acc_by_op[op]:>10.4f}")
+
+    print(f"\n  Overall accuracy: {overall:.4f}  (chance = 10%)")
     print()
 
 
@@ -267,7 +326,7 @@ def print_accuracy_table(
 def save_run_results(
     variant: str,
     seed: int,
-    results: Dict[str, Dict[int, Any]],
+    results: Dict[str, Any],
     force_all_iters: bool,
 ) -> Path:
     """Write per-run JSON to figures/eval_{variant}_seed{seed}.json."""
@@ -283,6 +342,11 @@ def save_run_results(
             str(d): round(v, 6)
             for d, v in sorted(results["accuracy_by_depth"].items())
         },
+        "accuracy_by_op": {
+            op: round(v, 6)
+            for op, v in sorted(results["accuracy_by_op"].items())
+        },
+        "overall_accuracy": round(results["overall_accuracy"], 6),
     }
     if results.get("avg_exit_iter_by_depth"):
         payload["avg_exit_iter_by_depth"] = {
@@ -300,85 +364,86 @@ def save_run_results(
     return out_path
 
 
-def save_summary(all_run_results: Dict[Tuple[str, int], Dict[str, Dict[int, Any]]]) -> Path:
+def _aggregate_stats(
+    values_list: List[float],
+) -> Tuple[float, float]:
+    """Compute mean and sample std from a list of floats."""
+    n = len(values_list)
+    if n == 0:
+        return 0.0, 0.0
+    mean = sum(values_list) / n
+    if n > 1:
+        variance = sum((v - mean) ** 2 for v in values_list) / (n - 1)
+        std = variance ** 0.5
+    else:
+        std = 0.0
+    return mean, std
+
+
+def save_summary(
+    all_run_results: Dict[Tuple[str, int], Dict[str, Any]],
+) -> Path:
     """Aggregate across seeds and write eval_summary.json.
 
-    For each variant, computes mean ± std of accuracy at each depth
-    across all available seeds.
+    For each variant, computes mean ± std of accuracy at each depth and
+    each root operation across all available seeds.
     """
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
     out_path = FIGURES_DIR / "eval_summary.json"
 
     # Group by variant
-    variant_results: Dict[str, List[Dict[int, float]]] = defaultdict(list)
-    variant_exit_results: Dict[str, List[Dict[int, float]]] = defaultdict(list)
-
+    variant_results: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for (variant, seed), results in all_run_results.items():
-        variant_results[variant].append(results["accuracy_by_depth"])
-        if results.get("avg_exit_iter_by_depth"):
-            variant_exit_results[variant].append(results["avg_exit_iter_by_depth"])
+        variant_results[variant].append(results)
 
-    summary: Dict[str, Any] = {}
+    summary: Dict[str, Any] = {"variants": {}}
 
     for variant in VARIANTS:
-        acc_dicts = variant_results.get(variant, [])
-        if not acc_dicts:
+        run_list = variant_results.get(variant, [])
+        if not run_list:
             continue
 
-        # Collect all depths seen
-        all_depths = sorted(set(d for ad in acc_dicts for d in ad))
-
-        acc_stats: Dict[str, Dict[str, float]] = {}
+        # -- per-depth accuracy stats --
+        all_depths = sorted(set(
+            d for r in run_list for d in r["accuracy_by_depth"]
+        ))
+        mean_acc_by_depth: Dict[str, List[float]] = {}
         for d in all_depths:
-            values = [ad[d] for ad in acc_dicts if d in ad]
-            if not values:
-                continue
-            n = len(values)
-            mean = sum(values) / n
-            if n > 1:
-                variance = sum((v - mean) ** 2 for v in values) / (n - 1)
-                std = variance ** 0.5
-            else:
-                std = 0.0
-            acc_stats[str(d)] = {
-                "mean": round(mean, 6),
-                "std": round(std, 6),
-                "n": n,
-            }
+            values = [r["accuracy_by_depth"][d] for r in run_list if d in r["accuracy_by_depth"]]
+            m, s = _aggregate_stats(values)
+            mean_acc_by_depth[str(d)] = [round(m, 6), round(s, 6)]
+
+        # -- per-op accuracy stats --
+        mean_acc_by_op: Dict[str, List[float]] = {}
+        for op in ROOT_OPS:
+            values = [r["accuracy_by_op"][op] for r in run_list if op in r.get("accuracy_by_op", {})]
+            if values:
+                m, s = _aggregate_stats(values)
+                mean_acc_by_op[op] = [round(m, 6), round(s, 6)]
+
+        # -- overall accuracy stats --
+        overall_values = [r["overall_accuracy"] for r in run_list]
+        overall_m, overall_s = _aggregate_stats(overall_values)
 
         entry: Dict[str, Any] = {
-            "n_seeds": len(acc_dicts),
-            "accuracy_by_depth": acc_stats,
+            "n_seeds": len(run_list),
+            "mean_acc_by_depth": mean_acc_by_depth,
+            "mean_acc_by_op": mean_acc_by_op,
+            "overall_mean_acc": [round(overall_m, 6), round(overall_s, 6)],
         }
 
-        # Exit iteration stats for looped variants
-        exit_dicts = variant_exit_results.get(variant, [])
+        # -- exit iteration stats for looped variants --
+        exit_dicts = [r["avg_exit_iter_by_depth"] for r in run_list if r.get("avg_exit_iter_by_depth")]
         if exit_dicts:
             exit_depths = sorted(set(d for ed in exit_dicts for d in ed))
-            exit_stats: Dict[str, Dict[str, float]] = {}
+            mean_exit_by_depth: Dict[str, List[float]] = {}
             for d in exit_depths:
                 values = [ed[d] for ed in exit_dicts if d in ed]
-                if not values:
-                    continue
-                n = len(values)
-                mean = sum(values) / n
-                if n > 1:
-                    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
-                    std = variance ** 0.5
-                else:
-                    std = 0.0
-                exit_stats[str(d)] = {
-                    "mean": round(mean, 4),
-                    "std": round(std, 4),
-                    "n": n,
-                }
-            entry["avg_exit_iter_by_depth"] = exit_stats
+                m, s = _aggregate_stats(values)
+                mean_exit_by_depth[str(d)] = [round(m, 4), round(s, 4)]
+            entry["mean_exit_iter_by_depth"] = mean_exit_by_depth
 
-        all_means = [v["mean"] for v in acc_stats.values()]
-        if all_means:
-            entry["overall_mean_acc"] = round(sum(all_means) / len(all_means), 6)
-
-        summary[variant] = entry
+        summary["variants"][variant] = entry
 
     with open(out_path, "w") as f:
         json.dump(summary, f, indent=2)
@@ -393,23 +458,29 @@ def print_summary_table(summary_path: Path) -> None:
     with open(summary_path) as f:
         summary = json.load(f)
 
+    variants_data = summary.get("variants", {})
+
     print()
     print("=" * 78)
     print("  AGGREGATED SUMMARY  (mean ± std across seeds)")
     print("=" * 78)
 
     for variant in VARIANTS:
-        if variant not in summary:
+        if variant not in variants_data:
             continue
-        entry = summary[variant]
-        acc = entry["accuracy_by_depth"]
+        entry = variants_data[variant]
+        acc = entry["mean_acc_by_depth"]
+        acc_op = entry.get("mean_acc_by_op", {})
         n_seeds = entry.get("n_seeds", "?")
+        overall = entry.get("overall_mean_acc", [0.0, 0.0])
 
         print(f"\n  ── {variant} ({n_seeds} seeds) ──")
 
-        has_exit = "avg_exit_iter_by_depth" in entry
+        # Per-depth table
+        has_exit = "mean_exit_iter_by_depth" in entry
+        exit_data: Dict[str, Any] = entry.get("mean_exit_iter_by_depth", {})
+        print("\n  Per-Depth:")
         if has_exit:
-            exit_data = entry["avg_exit_iter_by_depth"]
             print(f"  {'Depth':>5}  {'Acc Mean':>9}  {'± Std':>7}  {'Exit Mean':>10}")
             print(f"  {'-' * 5}  {'-' * 9}  {'-' * 7}  {'-' * 10}")
         else:
@@ -417,19 +488,26 @@ def print_summary_table(summary_path: Path) -> None:
             print(f"  {'-' * 5}  {'-' * 9}  {'-' * 7}")
 
         for d_str in sorted(acc.keys(), key=lambda x: int(x)):
-            d = int(d_str)
-            mean = acc[d_str]["mean"]
-            std = acc[d_str]["std"]
+            mean, std = acc[d_str]
             if has_exit and d_str in exit_data:
-                e_mean = exit_data[d_str]["mean"]
-                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}  {e_mean:>10.2f}")
+                e_mean = exit_data[d_str][0]
+                print(f"  {int(d_str):>5}  {mean:>9.4f}  {std:>7.4f}  {e_mean:>10.2f}")
             elif has_exit:
-                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}  {'—':>10}")
+                print(f"  {int(d_str):>5}  {mean:>9.4f}  {std:>7.4f}  {'—':>10}")
             else:
-                print(f"  {d:>5}  {mean:>9.4f}  {std:>7.4f}")
+                print(f"  {int(d_str):>5}  {mean:>9.4f}  {std:>7.4f}")
 
-        if "overall_mean_acc" in entry:
-            print(f"  Overall avg: {entry['overall_mean_acc']:.4f}")
+        # Per-op table
+        if acc_op:
+            print("\n  Per-Operation:")
+            print(f"  {'Op':>5}  {'Acc Mean':>9}  {'± Std':>7}")
+            print(f"  {'-' * 5}  {'-' * 9}  {'-' * 7}")
+            for op in ROOT_OPS:
+                if op in acc_op:
+                    mean, std = acc_op[op]
+                    print(f"  {op:>5}  {mean:>9.4f}  {std:>7.4f}")
+
+        print(f"\n  Overall: {overall[0]:.4f} ± {overall[1]:.4f}  (chance = 10%)")
 
     print()
 
@@ -438,39 +516,34 @@ def print_summary_table(summary_path: Path) -> None:
 # Evaluation runners
 # ---------------------------------------------------------------------------
 
-def build_test_loaders(device: torch.device) -> List[Tuple[str, DataLoader]]:
-    """Build DataLoader(s) for the test set(s).
+def build_test_loader(device: torch.device) -> Tuple[DataLoader, List[str]]:
+    """Build DataLoader for the test set and extract root ops.
 
-    v3: prefers a single `test.jsonl` covering the full depth range.
-    Legacy v1/v2: falls back to `test_id.jsonl` + `test_ood.jsonl` split.
-    Returns a list of (label, loader) pairs.
+    Returns (loader, root_ops) where root_ops[i] is the root operation
+    string for sample i.
     """
-    pin = device.type == "cuda"
-
-    def _loader(path: Path) -> DataLoader:
-        return DataLoader(
-            BracketDataset(path),
-            batch_size=EVAL_BATCH_SIZE,
-            shuffle=False,
-            num_workers=0,
-            drop_last=False,
-            pin_memory=pin,
+    test_path = DATA_DIR / "test.jsonl"
+    if not test_path.exists():
+        raise FileNotFoundError(
+            f"No test data found at {test_path}.\n"
+            f"  Run `python -m polly.data` first to generate splits."
         )
 
-    v3_path = DATA_DIR / "test.jsonl"
-    if v3_path.exists():
-        return [("test", _loader(v3_path))]
-
-    id_path = DATA_DIR / "test_id.jsonl"
-    ood_path = DATA_DIR / "test_ood.jsonl"
-    if id_path.exists() and ood_path.exists():
-        return [("test_id", _loader(id_path)), ("test_ood", _loader(ood_path))]
-
-    raise FileNotFoundError(
-        f"No test data found in {DATA_DIR}. "
-        f"Expected `test.jsonl` (v3) or `test_id.jsonl`+`test_ood.jsonl` (v1/v2).\n"
-        f"  Run `python -m polly.data` first to generate splits."
+    pin = device.type == "cuda"
+    loader = DataLoader(
+        ListOpsDataset(test_path),
+        batch_size=EVAL_BATCH_SIZE,
+        shuffle=False,
+        num_workers=0,
+        drop_last=False,
+        pin_memory=pin,
     )
+
+    # Extract root ops from the raw JSONL
+    input_strings = _load_test_inputs(test_path)
+    root_ops = [extract_root_op(s) for s in input_strings]
+
+    return loader, root_ops
 
 
 def evaluate_single_run(
@@ -478,27 +551,24 @@ def evaluate_single_run(
     seed: int,
     device: torch.device,
     force_all_iters: bool = False,
-) -> Dict[str, Dict[int, Any]]:
-    """Evaluate a single (variant, seed) checkpoint on both test splits."""
+) -> Dict[str, Any]:
+    """Evaluate a single (variant, seed) checkpoint on the test set."""
     print(f"\n[eval] Loading {variant} seed={seed} ...")
     model, meta = load_checkpoint(variant, seed, device)
 
-    loaders = build_test_loaders(device)
+    test_loader, root_ops = build_test_loader(device)
 
-    combined: Dict[str, Dict[int, Any]] = {
-        "accuracy_by_depth": {},
-        "avg_exit_iter_by_depth": {},
-    }
-    for label, loader in loaders:
-        print(f"[eval] Evaluating on {label} ...")
-        res = evaluate_model(model, loader, device, force_all_iters=force_all_iters)
-        combined["accuracy_by_depth"].update(res["accuracy_by_depth"])
-        combined["avg_exit_iter_by_depth"].update(res["avg_exit_iter_by_depth"])
+    print(f"[eval] Evaluating on test set ({len(root_ops)} samples) ...")
+    results = evaluate_model(
+        model, test_loader, device,
+        force_all_iters=force_all_iters,
+        root_ops=root_ops,
+    )
 
-    print_accuracy_table(variant, seed, combined, meta)
-    save_run_results(variant, seed, combined, force_all_iters)
+    print_accuracy_table(variant, seed, results, meta)
+    save_run_results(variant, seed, results, force_all_iters)
 
-    return combined
+    return results
 
 
 def evaluate_all(
@@ -506,8 +576,7 @@ def evaluate_all(
     force_all_iters: bool = False,
 ) -> None:
     """Evaluate all variants × seeds that have checkpoints, then aggregate."""
-    all_run_results: Dict[Tuple[str, int], Dict[str, Dict[int, Any]]] = {}
-
+    all_run_results: Dict[Tuple[str, int], Dict[str, Any]] = {}
     skipped: List[str] = []
 
     for variant in VARIANTS:
@@ -541,7 +610,7 @@ def evaluate_all(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate bracket-matching transformer checkpoints.",
+        description="Evaluate ListOps transformer checkpoints.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"

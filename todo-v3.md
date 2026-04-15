@@ -1,5 +1,26 @@
 # Polly v3 — Depth-Curve as Architectural Probe
 
+> **DEPRECATED 2026-04-15.** Superseded by [`todo-v4.md`](todo-v4.md).
+> Bracket-matching is retired as the experimental task; v4 migrates to ListOps.
+>
+> **Postmortem (v3, 10k-step Kaggle run, seed 100):**
+> - `vanilla` hit `val_acc = 1.000` at every depth 1–60. The task never
+>   became hard — a 6-layer bidirectional 300K-param transformer solves
+>   bracket balance via counter-plus-LIFO-check, which sits in TC⁰. Bumping
+>   `D_max` from 30 → 45 → 60 did not change this.
+> - `looped` never trained: val_loss 0.696 → 0.656 over 10k steps, val_acc
+>   stalled at 0.57. Diagnostics on the checkpoint showed per-iter accuracy
+>   flat at ~0.55 across all four iterations (tied-weight stack produces no
+>   iteration-dependent computation) and exit_dist front-loaded to iter 1
+>   (40% mass). The Phase-E PonderNet loss (`task = E[CE_t]` + `KL(exit ‖
+>   Geo(0.3))`) compounded a pre-existing failure: later iters weren't
+>   learning anything the task loss could reward, so KL pressure won and
+>   pushed mass forward, reinforcing single-pass optimisation.
+> - Net: no capability gap to measure, and looped variants never functional.
+>   v4 reframes registers as training scaffolding (not the target), drops
+>   `vanilla_reg`, and migrates to a task where vanilla cannot brute-force
+>   its way to 100%.
+>
 > Supersedes `todo-v2.md`. Spawned 2026-04-14 after v2 pilot results.
 > Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked/decision needed
 

@@ -1,23 +1,31 @@
 """
-data.py — Deterministic data generation for bracket-matching (multi-type).
+data.py — Deterministic data generation for ListOps (Nangia & Bowman 2018).
 
-Vocabulary (v2 — three bracket types):
-    PAD = 0
-    (   = 1    )  = 2
-    [   = 3    ]  = 4
-    {   = 5    }  = 6
-    CLS = 7
+ListOps is a synthetic task for testing hierarchical reasoning. Nested
+prefix-notation expressions over four operations and digits 0–9.
+Output is a single digit 0–9.
 
-A string is balanced iff every opener is closed by the *matching* closer in
-stack order.  `([)]` has correct per-type counts but is invalid — recognizing
-this requires a stack, not just counters.
+Operations:
+    MIN(args) → minimum of argument values
+    MAX(args) → maximum of argument values
+    MED(args) → median (lower-middle for even-length lists)
+    SM(args)  → (sum of argument values) mod 10
+
+Expression format (string):
+    [ OP arg1 arg2 ... argN ]
+    where each arg is a digit 0-9 or a nested [ OP ... ] expression.
+
+Vocabulary / Token IDs:
+    PAD=0, 0..9 → 1..10, MIN=11, MAX=12, MED=13, SM=14, [=15, ]=16, CLS=17
 
 Usage:
-    python polly/data.py          # from the pollysec/ directory
+    python polly/data.py              # from the pollysec/ directory
+    python polly/data.py --d-max 4    # shallower expressions
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import random
 from collections import Counter
@@ -30,370 +38,367 @@ from torch.utils.data import Dataset
 # ── Vocabulary ────────────────────────────────────────────────────────────────
 
 PAD = 0
-OPEN_PAREN = 1
-CLOSE_PAREN = 2
-OPEN_BRACKET = 3
-CLOSE_BRACKET = 4
-OPEN_BRACE = 5
-CLOSE_BRACE = 6
-CLS = 7
+CLS = 17
 
-VOCAB_SIZE = 8
+VOCAB_SIZE = 18
+MAX_SEQ_LEN = 128
 
-# Bracket pairs: (opener_char, closer_char, opener_id, closer_id)
-BRACKET_TYPES: List[Tuple[str, str]] = [("(", ")"), ("[", "]"), ("{", "}")]
-OPENERS = {"(", "[", "{"}
-CLOSERS = {")", "]", "}"}
-MATCH_OPENER: Dict[str, str] = {"(": ")", "[": "]", "{": "}"}
-MATCH_CLOSER: Dict[str, str] = {")": "(", "]": "[", "}": "{"}
-
+# Token map: string token → integer ID
 TOKEN_MAP: Dict[str, int] = {
-    "(": OPEN_PAREN,
-    ")": CLOSE_PAREN,
-    "[": OPEN_BRACKET,
-    "]": CLOSE_BRACKET,
-    "{": OPEN_BRACE,
-    "}": CLOSE_BRACE,
+    "0": 1, "1": 2, "2": 3, "3": 4, "4": 5,
+    "5": 6, "6": 7, "7": 8, "8": 9, "9": 10,
+    "MIN": 11, "MAX": 12, "MED": 13, "SM": 14,
+    "[": 15, "]": 16,
 }
 
-MAX_SEQ_LEN = 128  # 1 CLS + up to 2*60 bracket chars + at least 1 PAD (depth 60)
+# Reverse map for decoding
+ID_TO_TOKEN: Dict[int, str] = {v: k for k, v in TOKEN_MAP.items()}
+ID_TO_TOKEN[PAD] = "<PAD>"
+ID_TO_TOKEN[CLS] = "<CLS>"
+
+OPS = ["MIN", "MAX", "MED", "SM"]
+OP_IDS = {11, 12, 13, 14}
 
 
-# ── Validation helpers ────────────────────────────────────────────────────────
+# ── Expression tree representation ───────────────────────────────────────────
+
+class Expr:
+    """An expression node: either a leaf digit or an op with children."""
+    __slots__ = ("op", "children", "value")
+
+    def __init__(self, op: Optional[str] = None, children: Optional[List["Expr"]] = None,
+                 value: Optional[int] = None):
+        self.op = op            # None for leaf
+        self.children = children or []
+        self.value = value      # set for leaf (0–9), or computed after eval
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.op is None
+
+    def depth(self) -> int:
+        """Max nesting depth. Leaf=0, single [OP d1 d2]=1."""
+        if self.is_leaf:
+            return 0
+        if not self.children:
+            return 1
+        return 1 + max(c.depth() for c in self.children)
+
+    def token_count(self) -> int:
+        """Number of tokens in the string representation."""
+        if self.is_leaf:
+            return 1  # just the digit
+        # [ OP arg1 arg2 ... argN ]  → 2 (brackets) + 1 (op) + sum(children)
+        return 3 + sum(c.token_count() for c in self.children)
+
+    def to_tokens(self) -> List[str]:
+        """Convert to list of string tokens."""
+        if self.is_leaf:
+            return [str(self.value)]
+        tokens = ["[", self.op]
+        for c in self.children:
+            tokens.extend(c.to_tokens())
+        tokens.append("]")
+        return tokens
+
+    def to_string(self) -> str:
+        return " ".join(self.to_tokens())
 
 
-def is_balanced(s: str) -> bool:
-    """Stack-based check: True iff *s* is balanced with correct type matching."""
-    stack: list[str] = []
-    for ch in s:
-        if ch in OPENERS:
-            stack.append(ch)
-        elif ch in CLOSERS:
-            if not stack:
-                return False
-            opener = stack.pop()
-            if MATCH_OPENER[opener] != ch:
-                return False
+# ── Expression evaluation ────────────────────────────────────────────────────
+
+def _eval_expr(expr: Expr) -> int:
+    """Recursively evaluate an Expr tree. Returns integer 0–9."""
+    if expr.is_leaf:
+        assert expr.value is not None
+        return expr.value
+
+    child_vals = [_eval_expr(c) for c in expr.children]
+
+    if expr.op == "MIN":
+        result = min(child_vals)
+    elif expr.op == "MAX":
+        result = max(child_vals)
+    elif expr.op == "MED":
+        s = sorted(child_vals)
+        n = len(s)
+        if n % 2 == 1:
+            result = s[n // 2]
         else:
-            return False
-    return len(stack) == 0
+            result = s[n // 2 - 1]  # lower-middle
+    elif expr.op == "SM":
+        result = sum(child_vals) % 10
+    else:
+        raise ValueError(f"Unknown op: {expr.op!r}")
+
+    assert 0 <= result <= 9, f"Eval result out of range: {result}"
+    return result
 
 
-def passes_counter_test(s: str) -> bool:
-    """One-counter test (type-blind): True iff total open == total close and
-    running count never goes negative.  This is the test that a single-type
-    bracket checker uses — it does NOT verify type matching."""
-    depth = 0
-    for ch in s:
-        if ch in OPENERS:
-            depth += 1
-        elif ch in CLOSERS:
-            depth -= 1
-        else:
-            return False
-        if depth < 0:
-            return False
-    return depth == 0
+def evaluate_expression(tokens: List[str]) -> int:
+    """Evaluate a ListOps expression given as a list of string tokens.
+
+    This is the public API used by other modules for verification.
+    Example: evaluate_expression(["[", "SM", "3", "1", "8", "]"]) → 2
+    """
+    expr, end = _parse_tokens(tokens, 0)
+    assert end == len(tokens), f"Trailing tokens after position {end}: {tokens[end:]}"
+    return _eval_expr(expr)
 
 
-def max_nesting_depth(s: str) -> int:
-    """Max nesting depth (type-agnostic — any opener increments)."""
-    depth = 0
-    best = 0
-    for ch in s:
-        if ch in OPENERS:
-            depth += 1
-            if depth > best:
-                best = depth
-        elif ch in CLOSERS:
-            depth -= 1
-    return best
+def evaluate_expression_string(s: str) -> int:
+    """Convenience: evaluate a space-separated expression string."""
+    return evaluate_expression(s.split())
 
 
-# ── Balanced string generation ────────────────────────────────────────────────
+def _parse_tokens(tokens: List[str], pos: int) -> Tuple[Expr, int]:
+    """Parse tokens starting at pos, return (Expr, next_pos)."""
+    if tokens[pos] == "[":
+        # [ OP arg1 arg2 ... ]
+        op = tokens[pos + 1]
+        assert op in OPS, f"Expected op at pos {pos + 1}, got {op!r}"
+        children = []
+        i = pos + 2
+        while tokens[i] != "]":
+            child, i = _parse_tokens(tokens, i)
+            children.append(child)
+        return Expr(op=op, children=children), i + 1  # skip ]
+    else:
+        # digit
+        d = int(tokens[pos])
+        assert 0 <= d <= 9
+        return Expr(value=d), pos + 1
 
 
-def generate_balanced(depth: int, rng: random.Random,
-                      max_total_len: int = 32) -> str:
-    """Generate a balanced multi-type bracket string with max nesting depth
-    exactly *depth*.
+# ── Expression generation ────────────────────────────────────────────────────
+
+def generate_expression(target_depth: int, rng: random.Random,
+                        a_max: int = 5, max_tokens: int = 120) -> Optional[Expr]:
+    """Generate an expression with exactly `target_depth` as max nesting depth.
 
     Strategy:
-        1. Build a depth-*d* kernel with a random bracket type at each level:
-           e.g. depth 3 → "([{" + "}])" → "([{}])"
-        2. Insert matched pairs (random type, immediately closed like "()") at
-           random positions — keeps depth unchanged.
-        3. Wrap-insertions: wrap an existing sub-expression with a new pair,
-           only where local depth < target depth.
+        - At depth 0: return a random digit leaf.
+        - Otherwise: pick a random op, random number of args [2, a_max].
+          One arg slot (the "spine") MUST be a subexpression of target_depth-1.
+          Other args are either digits or shallower subexpressions, chosen
+          based on remaining token budget and depth budget.
+
+    Returns None if the expression can't fit in the token budget.
     """
-    if depth < 1:
-        raise ValueError("depth must be >= 1")
-
-    # 1. Build kernel
-    types = [rng.choice(BRACKET_TYPES) for _ in range(depth)]
-    openers = "".join(t[0] for t in types)
-    closers = "".join(t[1] for t in reversed(types))
-    s = openers + closers
-
-    # How much room for extra pairs?
-    room = (max_total_len - len(s)) // 2
-
-    # 2. Insert immediately-closed pairs at random positions
-    if room > 0:
-        n_extra = rng.randint(0, room)
-    else:
-        n_extra = 0
-
-    for _ in range(n_extra):
-        if len(s) + 2 > max_total_len:
-            break
-        pos = rng.randint(0, len(s))
-        pair = rng.choice(BRACKET_TYPES)
-        candidate = s[:pos] + pair[0] + pair[1] + s[pos:]
-        # Inserting an immediately-closed pair can never increase depth
-        # beyond +1 at that position, but check to be safe.
-        if max_nesting_depth(candidate) == depth and is_balanced(candidate):
-            s = candidate
-
-    # 3. Wrap-insertions for structural variety
-    room = (max_total_len - len(s)) // 2
-    attempts = min(room, 12) if room > 0 else 0
-    for _ in range(attempts):
-        if len(s) + 2 > max_total_len:
-            break
-        # Find positions where running depth < depth - 1
-        # (wrapping adds +1 depth to that sub-expression)
-        running = 0
-        eligible: List[int] = []
-        for i, ch in enumerate(s):
-            if ch in OPENERS:
-                if running < depth - 1:
-                    eligible.append(i)
-                running += 1
-            elif ch in CLOSERS:
-                running -= 1
-        if not eligible:
-            break
-        idx = rng.choice(eligible)
-        # Find matching closer for opener at idx
-        lvl = 0
-        match_idx = idx
-        for j in range(idx, len(s)):
-            if s[j] in OPENERS:
-                lvl += 1
-            elif s[j] in CLOSERS:
-                lvl -= 1
-            if lvl == 0:
-                match_idx = j
-                break
-        pair = rng.choice(BRACKET_TYPES)
-        candidate = s[:idx] + pair[0] + s[idx:match_idx + 1] + pair[1] + s[match_idx + 1:]
-        if (len(candidate) <= max_total_len
-                and max_nesting_depth(candidate) == depth
-                and is_balanced(candidate)):
-            s = candidate
-
-    assert is_balanced(s), f"BUG: generated unbalanced string: {s!r}"
-    assert max_nesting_depth(s) == depth, (
-        f"BUG: expected depth {depth}, got {max_nesting_depth(s)} for {s!r}"
-    )
-    return s
+    return _gen(target_depth, target_depth, rng, a_max, max_tokens)
 
 
-# ── Unbalanced string generation ─────────────────────────────────────────────
+def _gen(target_depth: int, remaining_depth: int, rng: random.Random,
+         a_max: int, budget: int) -> Optional[Expr]:
+    """Internal recursive generator.
 
-
-def _corrupt_mismatch(s: str, rng: random.Random) -> Optional[str]:
-    """Replace a closer with a *different-type* closer.
-
-    This keeps total open/close counts unchanged and even per-type counts
-    can look fine, but breaks stack matching.  This is the corruption that
-    specifically requires stack-based reasoning to detect.
+    Args:
+        target_depth:   the depth this particular subtree must achieve exactly.
+        remaining_depth: unused — we track via target_depth.
+        rng:            random state.
+        a_max:          max args per op.
+        budget:         remaining token budget for this subtree.
     """
-    closer_indices = [i for i, ch in enumerate(s) if ch in CLOSERS]
-    if not closer_indices:
+    if target_depth == 0:
+        # Leaf: random digit
+        if budget < 1:
+            return None
+        return Expr(value=rng.randint(0, 9))
+
+    # Need at least: [ OP spine_arg one_more_arg ] = 5 tokens minimum
+    # (spine_arg could be a nested expr needing more, but we'll check below)
+    if budget < 5:
         return None
-    rng.shuffle(closer_indices)
-    for idx in closer_indices:
-        original = s[idx]
-        other_closers = [c for c in CLOSERS if c != original]
-        replacement = rng.choice(other_closers)
-        candidate = s[:idx] + replacement + s[idx + 1:]
-        if not is_balanced(candidate):
-            return candidate
-    return None
+
+    op = rng.choice(OPS)
+    n_args = rng.randint(2, a_max)
+
+    # The spine slot — must reach target_depth - 1
+    spine_idx = rng.randint(0, n_args - 1)
+
+    # Overhead: [ OP ... ] = 3 tokens
+    remaining_budget = budget - 3
+
+    children: List[Optional[Expr]] = [None] * n_args
+
+    # Generate spine first (it has priority for budget)
+    # Reserve at least 1 token per non-spine arg
+    spine_budget = remaining_budget - (n_args - 1)
+    if spine_budget < 1:
+        return None
+
+    spine_child = _gen(target_depth - 1, target_depth - 1, rng, a_max, spine_budget)
+    if spine_child is None:
+        return None
+
+    children[spine_idx] = spine_child
+    remaining_budget -= spine_child.token_count()
+
+    # Generate other args
+    for i in range(n_args):
+        if i == spine_idx:
+            continue
+
+        if remaining_budget < 1:
+            return None  # can't fit even a digit
+
+        # Reserve 1 token per remaining unfilled slot (excluding current)
+        unfilled_after = sum(1 for j in range(i + 1, n_args) if children[j] is None)
+        available = remaining_budget - unfilled_after
+
+        if available < 1:
+            return None
+
+        # Decide: digit or nested subexpression?
+        # If target_depth - 1 >= 1 and we have enough budget, maybe nest.
+        # Probability of nesting decreases as budget shrinks.
+        max_sub_depth = target_depth - 1  # sub-args can be up to this deep
+        # but they can't be exactly target_depth-1 (that's reserved for spine)
+        # Actually they CAN be — the constraint is that the OVERALL expr has
+        # depth = target_depth, which is guaranteed by the spine. Other args
+        # can be anything from depth 0 (digit) to target_depth-1.
+
+        nest_prob = 0.0
+        if max_sub_depth >= 1 and available >= 5:
+            # Bias toward nesting less as budget shrinks
+            nest_prob = min(0.5, available / 30.0)
+
+        if rng.random() < nest_prob:
+            # Pick a random depth for this sub-arg: 1..max_sub_depth
+            sub_depth = rng.randint(1, max_sub_depth)
+            sub_expr = _gen(sub_depth, sub_depth, rng, a_max, available)
+            if sub_expr is not None and sub_expr.depth() <= max_sub_depth:
+                children[i] = sub_expr
+                remaining_budget -= sub_expr.token_count()
+                continue
+
+        # Fallback: digit
+        children[i] = Expr(value=rng.randint(0, 9))
+        remaining_budget -= 1
+
+    # Verify all children are filled
+    assert all(c is not None for c in children)
+
+    expr = Expr(op=op, children=children)  # type: ignore[arg-type]
+
+    # Verify depth
+    actual_depth = expr.depth()
+    if actual_depth != target_depth:
+        # This shouldn't happen if spine generation is correct, but guard anyway.
+        return None
+
+    # Verify token count
+    if expr.token_count() > budget:
+        return None
+
+    return expr
 
 
-def _corrupt_flip(s: str, rng: random.Random) -> Optional[str]:
-    """Flip one bracket: opener → some closer, or closer → some opener."""
-    indices = list(range(len(s)))
-    rng.shuffle(indices)
-    for i in indices:
-        if s[i] in OPENERS:
-            replacement = rng.choice(list(CLOSERS))
-        else:
-            replacement = rng.choice(list(OPENERS))
-        candidate = s[:i] + replacement + s[i + 1:]
-        if not is_balanced(candidate):
-            return candidate
-    return None
+# ── Split generation ─────────────────────────────────────────────────────────
 
+def generate_split(depths: List[int], total_size: int, seed: int,
+                   a_max: int = 5, max_tokens: int = 120) -> List[Dict[str, Any]]:
+    """Generate a balanced split of ListOps examples.
 
-def _corrupt_delete(s: str, rng: random.Random) -> Optional[str]:
-    """Delete one bracket."""
-    indices = list(range(len(s)))
-    rng.shuffle(indices)
-    for i in indices:
-        candidate = s[:i] + s[i + 1:]
-        if not is_balanced(candidate):
-            return candidate
-    return None
+    Generates ~2× the needed count per (depth, label) bucket, then subsamples
+    to get roughly equal representation across the 10 output labels per depth.
 
+    Args:
+        depths:     list of target depths (e.g. [1,2,3,4,5,6])
+        total_size: total number of examples desired
+        seed:       RNG seed for determinism
+        a_max:      max args per op
+        max_tokens: max tokens per expression (excluding CLS/PAD)
 
-def _corrupt_insert(s: str, rng: random.Random, max_len: int = 32) -> Optional[str]:
-    """Insert one extra bracket at a random position."""
-    all_brackets = list(OPENERS | CLOSERS)
-    positions = list(range(len(s) + 1))
-    rng.shuffle(positions)
-    for pos in positions:
-        rng.shuffle(all_brackets)
-        for br in all_brackets:
-            candidate = s[:pos] + br + s[pos:]
-            if len(candidate) <= max_len and not is_balanced(candidate):
-                return candidate
-    return None
-
-
-def corrupt_balanced(s: str, rng: random.Random, force_mismatch: bool = False) -> Tuple[str, str]:
-    """Apply one random corruption to a balanced string to make it unbalanced.
-
-    Returns (corrupted_string, corruption_type).
-
-    When *force_mismatch* is True, only type-mismatch corruption is attempted
-    (used to ensure ~50 % of unbalanced examples are mismatches).
-    """
-    if force_mismatch:
-        result = _corrupt_mismatch(s, rng)
-        if result is not None:
-            return result, "mismatch"
-        # If mismatch failed (rare — e.g. only one bracket type present),
-        # fall through to general corruption.
-
-    # General corruption: try mismatch first (50 %), then others.
-    methods = ["mismatch", "flip", "delete", "insert"]
-    if not force_mismatch:
-        rng.shuffle(methods)
-
-    dispatch = {
-        "mismatch": _corrupt_mismatch,
-        "flip": _corrupt_flip,
-        "delete": _corrupt_delete,
-        "insert": _corrupt_insert,
-    }
-
-    for method in methods:
-        fn = dispatch[method]
-        result = fn(s, rng)
-        if result is not None:
-            return result, method
-
-    # Absolute fallback: delete the first character.
-    fallback = s[1:]
-    if not is_balanced(fallback):
-        return fallback, "delete_fallback"
-    fallback = s[:-1]
-    assert not is_balanced(fallback), f"BUG: cannot corrupt {s!r}"
-    return fallback, "delete_fallback"
-
-
-# ── Split generation ──────────────────────────────────────────────────────────
-
-
-def generate_split(
-    depths: List[int],
-    total_size: int,
-    seed: int,
-) -> List[Dict[str, Any]]:
-    """Generate a split of *total_size* examples spread uniformly across *depths*.
-
-    50 % balanced, 50 % unbalanced at each depth.
-    Of the unbalanced half, ~50 % are type-mismatch corruptions (the hard
-    cases that require stack reasoning), and ~50 % are flip/delete/insert.
+    Returns:
+        List of example dicts with keys: input, label, depth, length
     """
     rng = random.Random(seed)
+    per_depth = total_size // len(depths)
 
-    n_depths = len(depths)
-    per_depth = total_size // n_depths
-    assert per_depth % 2 == 0, (
-        f"per_depth={per_depth} is not even — adjust total_size or depths"
-    )
-    n_bal = per_depth // 2
-    n_unbal = per_depth // 2
+    # Target per (depth, label): ideally per_depth / 10
+    target_per_bucket = per_depth // 10
+    # Generate extra to allow balancing
+    gen_target = max(per_depth * 3, target_per_bucket * 25)  # generous overgeneration
 
-    corruption_stats: Counter[str] = Counter()
-    mismatch_counter_test_pass = 0
-    mismatch_total = 0
-
-    examples: List[Dict[str, Any]] = []
+    all_examples: List[Dict[str, Any]] = []
 
     for d in depths:
-        # ── Balanced examples ────────────────────────────────────────
-        bal_set: set[str] = set()
+        # Collect examples bucketed by label
+        buckets: Dict[int, List[Dict[str, Any]]] = {i: [] for i in range(10)}
         attempts = 0
-        while len(bal_set) < n_bal:
-            s = generate_balanced(d, rng)
-            bal_set.add(s)
-            attempts += 1
-            if attempts > n_bal * 20:
+        max_attempts = gen_target * 10  # safety limit
+
+        while attempts < max_attempts:
+            # Check if we have enough in every bucket
+            min_bucket = min(len(buckets[lb]) for lb in range(10))
+            if min_bucket >= target_per_bucket:
                 break
 
-        bal_list = list(bal_set)
-        while len(bal_list) < n_bal:
-            bal_list.append(rng.choice(list(bal_set)))
-        rng.shuffle(bal_list)
-        bal_list = bal_list[:n_bal]
+            attempts += 1
+            expr = generate_expression(d, rng, a_max=a_max, max_tokens=max_tokens)
+            if expr is None:
+                continue
 
-        for s in bal_list:
-            examples.append({"input": s, "label": 1, "depth": d})
+            # Evaluate
+            label = _eval_expr(expr)
+            assert 0 <= label <= 9
 
-        # ── Unbalanced examples ──────────────────────────────────────
-        # First half: force mismatch. Second half: any corruption.
-        n_mismatch = n_unbal // 2
-        n_general = n_unbal - n_mismatch
+            # Verify by re-parsing
+            token_list = expr.to_tokens()
+            verify_label = evaluate_expression(token_list)
+            assert verify_label == label, (
+                f"Eval mismatch: tree={label}, parsed={verify_label} "
+                f"for {' '.join(token_list)}"
+            )
 
-        for phase, count, force in [("mismatch", n_mismatch, True),
-                                     ("general", n_general, False)]:
-            for _ in range(count):
-                base = generate_balanced(d, rng)
-                corrupted, ctype = corrupt_balanced(base, rng, force_mismatch=force)
-                assert not is_balanced(corrupted), (
-                    f"BUG: corruption produced balanced string: {corrupted!r}"
-                )
-                corruption_stats[ctype] += 1
+            length = len(token_list)
+            assert length <= max_tokens, f"Expression too long: {length} > {max_tokens}"
 
-                # Track whether mismatch corruptions pass the counter test
-                if ctype == "mismatch":
-                    mismatch_total += 1
-                    if passes_counter_test(corrupted):
-                        mismatch_counter_test_pass += 1
+            ex = {
+                "input": " ".join(token_list),
+                "label": label,
+                "depth": d,
+                "length": length,
+            }
 
-                examples.append({
-                    "input": corrupted,
-                    "label": 0,
-                    "depth": d,
-                    "corruption": ctype,
-                })
+            if len(buckets[label]) < target_per_bucket * 3:
+                # Don't overfill any single bucket
+                buckets[label].append(ex)
 
-    rng.shuffle(examples)
-    return examples, corruption_stats, mismatch_total, mismatch_counter_test_pass
+        # Now subsample to get balanced representation
+        depth_examples: List[Dict[str, Any]] = []
+        for label in range(10):
+            bucket = buckets[label]
+            # Shuffle for randomness
+            rng.shuffle(bucket)
+            take = min(len(bucket), target_per_bucket)
+            depth_examples.extend(bucket[:take])
+
+        # If we're short (some labels rare at this depth), pad from overrepresented buckets
+        deficit = per_depth - len(depth_examples)
+        if deficit > 0:
+            # Gather leftover examples from all buckets
+            used_counts = {lb: min(len(buckets[lb]), target_per_bucket) for lb in range(10)}
+            leftover: List[Dict[str, Any]] = []
+            for label in range(10):
+                leftover.extend(buckets[label][used_counts[label]:])
+            rng.shuffle(leftover)
+            depth_examples.extend(leftover[:deficit])
+
+        rng.shuffle(depth_examples)
+        all_examples.extend(depth_examples)
+
+    # Final shuffle
+    rng.shuffle(all_examples)
+
+    return all_examples
 
 
 # ── I/O ───────────────────────────────────────────────────────────────────────
 
-
 def write_jsonl(examples: List[Dict[str, Any]], path: Path) -> None:
-    """Write examples to JSONL. The 'corruption' key is included for
-    diagnostics but can be ignored by the model."""
+    """Write examples to JSONL."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w") as f:
         for ex in examples:
@@ -407,15 +412,14 @@ def read_jsonl(path: Path) -> List[Dict[str, Any]]:
 
 # ── PyTorch Dataset ───────────────────────────────────────────────────────────
 
-
-class BracketDataset(Dataset):
-    """Loads a JSONL file and tokenizes multi-type bracket strings into
-    fixed-length integer tensors.
+class ListOpsDataset(Dataset):
+    """Loads a ListOps JSONL file and tokenizes space-separated expressions
+    into fixed-length integer tensors.
 
     Each sample returns:
-        input_ids      : LongTensor[MAX_SEQ_LEN]
-        attention_mask : LongTensor[MAX_SEQ_LEN]
-        label          : LongTensor scalar
+        input_ids      : LongTensor[MAX_SEQ_LEN]  — CLS prepended, PAD appended
+        attention_mask : LongTensor[MAX_SEQ_LEN]  — 1 for real tokens, 0 for PAD
+        label          : LongTensor scalar (0–9)
         depth          : LongTensor scalar
     """
 
@@ -428,10 +432,15 @@ class BracketDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor,
                                               torch.Tensor, torch.Tensor]:
         ex = self.examples[idx]
-        tokens = [CLS] + [TOKEN_MAP[ch] for ch in ex["input"]]
-        length = len(tokens)
+        str_tokens = ex["input"].split()
+        token_ids = [CLS] + [TOKEN_MAP[t] for t in str_tokens]
+        length = len(token_ids)
 
-        input_ids = tokens + [PAD] * (MAX_SEQ_LEN - length)
+        assert length <= MAX_SEQ_LEN, (
+            f"Tokenized length {length} exceeds MAX_SEQ_LEN {MAX_SEQ_LEN}"
+        )
+
+        input_ids = token_ids + [PAD] * (MAX_SEQ_LEN - length)
         attention_mask = [1] * length + [0] * (MAX_SEQ_LEN - length)
 
         return (
@@ -442,12 +451,14 @@ class BracketDataset(Dataset):
         )
 
 
-# ── CLI ───────────────────────────────────────────────────────────────────────
+# Backward-compat alias — other modules import BracketDataset
+BracketDataset = ListOpsDataset
 
 
-def print_summary(name: str, examples: List[Dict[str, Any]],
-                  corruption_stats: Counter, mismatch_total: int,
-                  mismatch_counter_pass: int) -> None:
+# ── CLI summary ───────────────────────────────────────────────────────────────
+
+def print_summary(name: str, examples: List[Dict[str, Any]]) -> None:
+    """Print per-depth × per-label frequency table."""
     depth_counts: Counter[int] = Counter()
     label_counts: Counter[int] = Counter()
     depth_label: Counter[Tuple[int, int]] = Counter()
@@ -458,89 +469,125 @@ def print_summary(name: str, examples: List[Dict[str, Any]],
         depth_label[(ex["depth"], ex["label"])] += 1
 
     total = len(examples)
-    n_bal = label_counts[1]
-    n_unbal = label_counts[0]
-    print(f"\n{'=' * 70}")
-    print(f"  {name}: {total:,} examples  "
-          f"(bal={n_bal:,}  unbal={n_unbal:,}  "
-          f"ratio={n_bal / total:.2%})")
-    print(f"{'=' * 70}")
-    print(f"  {'Depth':>5}  {'Total':>7}  {'Bal':>7}  {'Unbal':>7}")
-    print(f"  {'-' * 5}  {'-' * 7}  {'-' * 7}  {'-' * 7}")
-    for d in sorted(depth_counts):
-        t = depth_counts[d]
-        b = depth_label[(d, 1)]
-        u = depth_label[(d, 0)]
-        print(f"  {d:>5}  {t:>7,}  {b:>7,}  {u:>7,}")
+    all_depths = sorted(depth_counts.keys())
 
-    print(f"\n  Corruption breakdown:")
-    for ctype, count in corruption_stats.most_common():
-        pct = count / n_unbal * 100 if n_unbal > 0 else 0
-        print(f"    {ctype:>20s}: {count:>7,}  ({pct:.1f}%)")
+    print(f"\n{'=' * 80}")
+    print(f"  {name}: {total:,} examples")
+    print(f"{'=' * 80}")
 
-    if mismatch_total > 0:
-        pct_pass = mismatch_counter_pass / mismatch_total * 100
-        print(f"\n  Mismatch sanity: {mismatch_counter_pass}/{mismatch_total} "
-              f"({pct_pass:.1f}%) pass counter test but fail stack test ✓")
+    # Header row
+    hdr = f"  {'Depth':>5}  {'Total':>7}"
+    for lbl in range(10):
+        hdr += f"  {lbl:>5}"
+    print(hdr)
+    print(f"  {'-' * 5}  {'-' * 7}" + f"  {'-' * 5}" * 10)
 
+    for d in all_depths:
+        row = f"  {d:>5}  {depth_counts[d]:>7}"
+        for lbl in range(10):
+            row += f"  {depth_label[(d, lbl)]:>5}"
+        print(row)
+
+    # Total row
+    row = f"  {'ALL':>5}  {total:>7}"
+    for lbl in range(10):
+        row += f"  {label_counts.get(lbl, 0):>5}"
+    print(row)
+
+    # Per-label percentages
+    print("\n  Label distribution:")
+    for lbl in range(10):
+        c = label_counts.get(lbl, 0)
+        pct = c / total * 100 if total > 0 else 0
+        print(f"    label {lbl}: {c:>7,}  ({pct:5.1f}%)")
+
+
+# ── CLI main ──────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Generate ListOps data splits (train / val / test)."
+    )
+    parser.add_argument("--d-max", type=int, default=6,
+                        help="Maximum nesting depth (default: 6)")
+    parser.add_argument("--a-max", type=int, default=5,
+                        help="Maximum arguments per operation (default: 5)")
+    args = parser.parse_args()
+
+    d_max = args.d_max
+    a_max = args.a_max
     data_dir = Path(__file__).resolve().parent / "data"
 
-    # v3: single depth range covering 1..30 — train/val/test all sample from
-    # the same distribution. Per-depth accuracy on test is the experimental
-    # signal (see todo-v3.md). Sizes chosen so per_depth is even at every depth.
-    depths = list(range(1, 61))  # 60 depths
+    depths = list(range(1, d_max + 1))
+
     splits = {
-        "train": {
-            "depths": depths,
-            "total_size": 240_000,   # 4000 per depth
-            "seed": 42,
-            "filename": "train.jsonl",
-        },
-        "val": {
-            "depths": depths,
-            "total_size": 18_000,    # 400 per depth
-            "seed": 43,
-            "filename": "val.jsonl",
-        },
-        "test": {
-            "depths": depths,
-            "total_size": 18_000,    # 400 per depth
-            "seed": 44,
-            "filename": "test.jsonl",
-        },
+        "train": {"total_size": 240_000, "seed": 42, "filename": "train.jsonl"},
+        "val":   {"total_size": 18_000,  "seed": 43, "filename": "val.jsonl"},
+        "test":  {"total_size": 18_000,  "seed": 44, "filename": "test.jsonl"},
     }
 
+    max_tokens = MAX_SEQ_LEN - 2  # leave room for CLS + at least 1 PAD → 126
+    # Actually we want expressions to fit with CLS prepended and still be < 128.
+    # CLS takes 1 slot, expression takes `length` slots, rest is PAD.
+    # So expression can be at most MAX_SEQ_LEN - 1 = 127 tokens.
+    # But we want at least 1 PAD, so max_tokens = MAX_SEQ_LEN - 2 = 126.
+    # Spec says max_tokens=120 as a comfortable margin. Use that.
+    max_tokens = 120
+
+    print("ListOps data generation")
+    print(f"  D_max={d_max}, A_max={a_max}, depths={depths}")
+    print(f"  max_tokens={max_tokens}, MAX_SEQ_LEN={MAX_SEQ_LEN}")
+
     for name, cfg in splits.items():
-        print(f"Generating {name} …")
-        examples, corruption_stats, mm_total, mm_pass = generate_split(
-            depths=cfg["depths"],
+        print(f"\nGenerating {name} ({cfg['total_size']:,} examples) …")
+        examples = generate_split(
+            depths=depths,
             total_size=cfg["total_size"],
             seed=cfg["seed"],
+            a_max=a_max,
+            max_tokens=max_tokens,
         )
 
-        # ── Final validation pass ────────────────────────────────────
+        # ── Validation pass ──────────────────────────────────────────
+        n_validated = 0
         for ex in examples:
             s = ex["input"]
-            assert len(s) <= MAX_SEQ_LEN - 2, f"String too long ({len(s)}): {s!r}"
-            # Check all chars are valid brackets
-            assert all(ch in TOKEN_MAP for ch in s), f"Invalid chars in: {s!r}"
-            if ex["label"] == 1:
-                assert is_balanced(s), f"Labelled balanced but isn't: {s!r}"
-                assert max_nesting_depth(s) == ex["depth"], (
-                    f"Depth mismatch: expected {ex['depth']}, "
-                    f"got {max_nesting_depth(s)} for {s!r}"
-                )
-            else:
-                assert not is_balanced(s), (
-                    f"Labelled unbalanced but is balanced: {s!r}"
-                )
+            tokens = s.split()
+
+            # All tokens must be in TOKEN_MAP
+            for t in tokens:
+                assert t in TOKEN_MAP, f"Unknown token {t!r} in: {s}"
+
+            # Re-evaluate and check label
+            computed = evaluate_expression(tokens)
+            assert computed == ex["label"], (
+                f"Label mismatch: computed={computed}, stored={ex['label']} for: {s}"
+            )
+
+            # Check length
+            assert len(tokens) == ex["length"], (
+                f"Length mismatch: {len(tokens)} vs {ex['length']}"
+            )
+
+            # Check total fits in MAX_SEQ_LEN with CLS
+            assert len(tokens) + 1 <= MAX_SEQ_LEN, (
+                f"Expression + CLS exceeds MAX_SEQ_LEN: {len(tokens) + 1}"
+            )
+
+            # Check depth by re-parsing the tree
+            parsed_expr, _ = _parse_tokens(tokens, 0)
+            assert parsed_expr.depth() == ex["depth"], (
+                f"Depth mismatch: tree={parsed_expr.depth()}, stored={ex['depth']} for: {s}"
+            )
+
+            n_validated += 1
+
+        print(f"  ✓ {n_validated:,} examples validated")
 
         out_path = data_dir / cfg["filename"]
         write_jsonl(examples, out_path)
         print(f"  → wrote {out_path}  ({len(examples):,} examples)")
-        print_summary(name, examples, corruption_stats, mm_total, mm_pass)
+        print_summary(name, examples)
 
     print("\nDone ✓")
 

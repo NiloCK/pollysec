@@ -138,7 +138,7 @@ VARIANTS = {"vanilla", "vanilla_reg", "looped", "looped_reg"}
 
 # Hyperparameters (fixed by spec)
 VOCAB_SIZE = 8       # PAD=0, (=1, )=2, [=3, ]=4, {=5, }=6, CLS=7
-MAX_SEQ_LEN = 96     # 1 CLS + up to 2*45 bracket chars + padding (depth 45)
+MAX_SEQ_LEN = 128    # 1 CLS + up to 2*60 bracket chars + padding (depth 60)
 DIM = 64
 N_HEADS = 4
 FFN_DIM = 256

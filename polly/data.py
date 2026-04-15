@@ -56,7 +56,7 @@ TOKEN_MAP: Dict[str, int] = {
     "}": CLOSE_BRACE,
 }
 
-MAX_SEQ_LEN = 96  # 1 CLS + up to 2*45 bracket chars + at least 1 PAD (depth 45)
+MAX_SEQ_LEN = 128  # 1 CLS + up to 2*60 bracket chars + at least 1 PAD (depth 60)
 
 
 # ── Validation helpers ────────────────────────────────────────────────────────
@@ -490,11 +490,11 @@ def main() -> None:
     # v3: single depth range covering 1..30 — train/val/test all sample from
     # the same distribution. Per-depth accuracy on test is the experimental
     # signal (see todo-v3.md). Sizes chosen so per_depth is even at every depth.
-    depths = list(range(1, 46))  # 45 depths
+    depths = list(range(1, 61))  # 60 depths
     splits = {
         "train": {
             "depths": depths,
-            "total_size": 225_000,   # 5000 per depth
+            "total_size": 240_000,   # 4000 per depth
             "seed": 42,
             "filename": "train.jsonl",
         },

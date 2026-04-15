@@ -51,18 +51,18 @@ test set is the experimental signal — a curve, not a scalar.
 ## Phase A — Task redesign (single-range)
 
 - [x] **A.1** Collapse data splits
-  - [x] `polly/data.py`: one `depths = range(1, 31)` shared by
+  - [x] `polly/data.py`: single `depths = range(1, D_max + 1)` shared by
         train / val / test. `test_ood` dropped.
-  - [x] `D_max = 30`. Train 210k (7000/depth), val 15k (500/depth),
-        test 15k (500/depth). Per-depth class balance + mismatch-heavy
-        corruption retained from v2.
-        Mismatch sanity: 4860/4860 mismatch corruptions pass the counter
-        test and fail the stack test (as intended).
+  - [x] D_max progression: 30 → 45 (vanilla saturated at 30, dipped to
+        0.845 at 45) → **60** (current, to push vanilla further down).
+        Train 240k (4000/depth), val 18k (300/depth), test 18k (300/depth).
+        Per-depth class balance + mismatch-heavy corruption retained.
+  - [x] v3-d30 and v3-d45 archived alongside v1/v2.
 
 - [x] **A.2** Bump sequence length
-  - [x] `MAX_SEQ_LEN = 66` in both `polly/data.py` and `polly/model.py`.
-  - [x] Sanity check: depth-30 string has len 60 ≤ 64 (MAX-2 after
-        CLS+PAD). Final-pass assert updated to `len(s) <= MAX_SEQ_LEN - 2`.
+  - [x] `MAX_SEQ_LEN` progression: 66 (d=30) → 96 (d=45) → **128** (d=60).
+        Depth-60 string has len 120 ≤ 126 (MAX-2). Final-pass assert is
+        `len(s) <= MAX_SEQ_LEN - 2`.
 
 - [x] **A.3** Update `evaluate.py`
   - [x] `build_test_loaders` prefers v3 `test.jsonl`; falls back to
@@ -107,6 +107,66 @@ test set is the experimental signal — a curve, not a scalar.
 
 ---
 
+## Phase E — Make "looped" actually dynamic (prerequisite to real comparison)
+
+Per Open Questions `[!]`, the current looped variant runs T=4 every time. A
+fair comparison needs compute to be *conditional on input difficulty*, not
+fixed. Sketch of the minimum-viable rewrite:
+
+**Loss — replace current task+gate loss with PonderNet-style KL.**
+
+In `polly/train.py:compute_loss`, the looped branch currently does
+`Σ_ℓ w_ℓ · CE_ℓ  +  (-λ·H(exit_dist))` with hand-chosen `w_ℓ = [0.1, 0.2,
+0.3, 0.4]`. Replace with:
+
+```python
+exit_dist = compute_exit_distribution(exit_probs)    # (B, T), already exists
+task_loss = (exit_dist * torch.stack(ce_per_iter, dim=1)).sum(dim=1).mean()
+prior = geometric_prior(lambda_p=0.3, T=T).to(device)  # (T,)  ~[0.3, 0.21, 0.147, ...]
+kl_loss = F.kl_div(exit_dist.clamp(min=1e-8).log(), prior, reduction="batchmean")
+total_loss = task_loss + BETA * kl_loss
+```
+
+Where:
+- `task_loss` = expected CE under the model's exit distribution (no
+  hand-chosen w_ℓ — the model decides).
+- `kl_loss` pulls the exit distribution toward a geometric(λ_p) prior.
+  λ_p=0.3 → expected exit iter ≈ 3.3; tune λ_p to set the compute budget.
+- BETA (~0.01) controls strength. Drop the existing entropy bonus.
+
+**Exit mechanics — per-sample break at eval, soft exit at train.**
+
+In `polly/model.py:forward`, keep computing all T iterations at train time
+(soft exit via `exit_dist` weighting in loss — see above). At eval time,
+switch from the batch-level `(exit_prob > 0.8).all()` to per-sample:
+
+```python
+# at eval time, maintain a "still alive" mask
+alive = torch.ones(B, dtype=torch.bool, device=device)
+for t in range(T):
+    h_active = h[alive]                # only compute for living samples
+    h_active, r_active, _ = self._run_layers(h_active, mask[alive], r[alive])
+    h[alive] = h_active                # scatter back
+    # ... logits and exit_prob on h_active ...
+    exiting = (exit_prob_t > threshold)
+    alive[alive.clone()] &= ~exiting   # mark exited samples
+    if not alive.any():
+        break
+```
+
+Actual wall-clock savings at inference proportional to avg exit iter.
+
+**Estimated effort:** ~40 LOC across `train.py` + `model.py`, plus
+`compute_exit_distribution` already exists and returns what we need. New
+helpers needed: `geometric_prior(lambda_p, T)`.
+
+**Interpretation ground rule:** don't treat Phase E looped numbers as
+comparable to pre-Phase-E looped. It's a different architecture. If you
+have a pre-E curve saved, keep it labelled separately — the delta between
+"fixed T=4" and "dynamic" is itself a measurement worth writing up.
+
+---
+
 ## Phase D — Fallbacks (if D-bracketing doesn't separate architectures)
 
 If even `D_max = 45` has vanilla tracking looped, the bracket family is
@@ -131,10 +191,30 @@ by effort:
 
 ## Open questions (inherited + new)
 
-- [ ] Does the exit gate ever fire for anything hard, or is the entropy
-      bonus too weak? v2 showed `avg_exit_iter = 4.0` (max) at every
-      depth — either the task is too easy to need exit, or the gate is
-      functionally disabled.
+- [!] **The exit gate is functionally hard-coded to T=4 by design.**
+      Observed `avg_exit_iter = 4.00` in v2 isn't a task-difficulty
+      artefact; it follows from the loss + eval design:
+      - `L_gate = -λ · H(exit_distribution)` rewards *uniform* exit
+        probability (~0.25 each iter) — well below the 0.8 eval threshold.
+      - Eval break requires `(exit_prob > 0.8).all()` across the batch;
+        one hesitant sample in a batch of 256 vetoes the break for
+        everyone.
+      - Per-iter task-loss weights `[0.1, 0.2, 0.3, 0.4]` back-load
+        importance onto iter 4, further nudging toward full T=4.
+      - Gate bias initialised to −2 → sigmoid ≈ 0.12 (starts *against*
+        exiting).
+      Net effect: the "looped" architecture we're comparing vanilla
+      against is effectively a fixed-depth 4-iter recurrent net, not a
+      dynamic-compute model. Any per-depth curve comparison measures
+      "looping + more params/compute" vs. "single pass," not "dynamic
+      compute allocation." To actually test dynamic looping we'd need:
+      - A compute-penalty term in the loss (`+μ · E[t_exit]`).
+      - Per-sample exit (apply mask, skip further compute per-row).
+      - Either drop the entropy bonus or flip its sign so it rewards
+        *decisive* (low-entropy) exit distributions concentrated early.
+      Decision: flag the current looped variant as "fixed T=4" when
+      interpreting results; consider a D.4 phase if the v3 curve shows
+      interesting asymmetries worth following up.
 - [ ] Is the 3-layer vanilla just powerful enough that depth doesn't
       matter? A D.3-style smaller-model run would disambiguate
       "architecture vs. capacity" as the thing being tested.

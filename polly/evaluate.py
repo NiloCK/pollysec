@@ -147,12 +147,10 @@ def evaluate_model(
             logits_list = outputs["logits"]
             exit_probs_list = outputs["exit_probs"]
 
-            # Use the last iteration's logits for accuracy
-            logits = logits_list[-1]
-            preds = logits.argmax(dim=-1)
-            correct = (preds == labels)
-
             B = labels.shape[0]
+
+            # Default: use last iteration's logits (non-looped, or force_all_iters).
+            logits = logits_list[-1]
 
             # ------- per-sample exit iteration (looped only) -------
             # The model does batch-level early exit: it stops when ALL
@@ -181,6 +179,16 @@ def evaluate_model(
                     # When forcing all iters, report the actual number of
                     # iterations run (all T) for every sample.
                     per_sample_exit_iter = torch.full((B,), float(T), dtype=torch.float32)
+
+                # Gather per-sample logits from each sample's exit iteration.
+                if not force_all_iters:
+                    logits_stack = torch.stack(logits_list, dim=0)           # (T, B, C)
+                    exit_idx = (per_sample_exit_iter.long() - 1).clamp(min=0, max=T - 1)
+                    exit_idx = exit_idx.to(logits_stack.device)
+                    logits = logits_stack[exit_idx, torch.arange(B, device=logits_stack.device)]
+
+            preds = logits.argmax(dim=-1)
+            correct = (preds == labels)
 
             # ------- accumulate per-depth stats -------
             for i in range(B):

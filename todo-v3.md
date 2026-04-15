@@ -107,7 +107,7 @@ test set is the experimental signal — a curve, not a scalar.
 
 ---
 
-## Phase E — Make "looped" actually dynamic (prerequisite to real comparison)
+## Phase E — Make "looped" actually dynamic (**implemented 2026-04-15**)
 
 Per Open Questions `[!]`, the current looped variant runs T=4 every time. A
 fair comparison needs compute to be *conditional on input difficulty*, not
@@ -159,6 +159,28 @@ Actual wall-clock savings at inference proportional to avg exit iter.
 **Estimated effort:** ~40 LOC across `train.py` + `model.py`, plus
 `compute_exit_distribution` already exists and returns what we need. New
 helpers needed: `geometric_prior(lambda_p, T)`.
+
+**Landed changes (2026-04-15):**
+- `polly/train.py`: added `geometric_prior(λ_p, T, device)`. Replaced the
+  looped branch of `compute_loss` with PonderNet objective
+  (`task = E_{t~exit_dist}[CE_t]` + `β · KL(exit_dist ‖ Geo(λ_p))`).
+  Dropped the entropy bonus. Tunables: `DEFAULT_PONDER_LAMBDA_P = 0.3`,
+  `DEFAULT_PONDER_BETA = 0.01`.
+  Truncation note: with T=4 the untruncated E[t]=1/λ_p=3.33 collapses to
+  E[t]≈2.07 after renormalisation. If you want heavier compute, use
+  λ_p≈0.1 (gives E[t]≈2.8 truncated); if lighter, λ_p≈0.5 (E[t]≈1.5).
+- `polly/model.py`: removed batch-level `(exit_prob > 0.8).all()` break and
+  the `-2` gate-bias init (now zero → sigmoid 0.5). All T iters run at
+  both train and eval. Per-sample exit selection moved to `evaluate.py`.
+- `polly/evaluate.py`: gathers per-sample logits from each sample's exit
+  iter (first t with `exit_prob_t > DEFAULT_EXIT_THRESHOLD`, else T).
+  `force_all_iters` still picks last-iter logits as a diagnostic.
+- Sanity: `compute_loss` forward+backward verified on random input; prior
+  sums to 1; total loss finite.
+
+Known lingering limitation: `train.run_validation` still uses `logits_list[-1]`
+for val_acc (not per-sample exit), so `best.pt` selection may slightly
+mismatch the final test-time metric. Minor — can fix when it bites.
 
 **Interpretation ground rule:** don't treat Phase E looped numbers as
 comparable to pre-Phase-E looped. It's a different architecture. If you

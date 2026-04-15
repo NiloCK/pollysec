@@ -204,11 +204,12 @@ class BracketTransformer(nn.Module):
             elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
 
-        # Exit-gate bias: initialise toward "don't exit" so early training
-        # runs all iterations (sigmoid(−2) ≈ 0.12).
+        # Exit-gate init: neutral (sigmoid(0) = 0.5). Under PonderNet-style loss
+        # the KL to a geometric prior shapes the exit distribution; no need to
+        # bias against exiting at init.
         if self.is_looped:
             nn.init.zeros_(self.exit_gate.weight)
-            nn.init.constant_(self.exit_gate.bias, -2.0)
+            nn.init.zeros_(self.exit_gate.bias)
 
     # -------------------------------------------------------------- helpers
     def _embed(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -303,8 +304,13 @@ class BracketTransformer(nn.Module):
                 all_register_states.append(r)
         else:
             # -------- looped variants (looped, looped_reg) --------
-            n_iters = t_max
-            for t in range(n_iters):
+            # All T iterations compute at both train and eval. Per-sample
+            # exit selection happens downstream (evaluate.py picks logits
+            # from each sample's exit iter, which is the first t where the
+            # cumulative exit probability crosses `exit_threshold`, else T-1).
+            # This keeps forward batched and avoids ragged shapes; wall-clock
+            # inference savings via per-sample masking is a later optimisation.
+            for t in range(t_max):
                 h, r, _ = self._run_layers(h, attention_mask, r)
 
                 logits_t = self._compute_logits(h)
@@ -316,12 +322,6 @@ class BracketTransformer(nn.Module):
                 if self.has_register:
                     assert r is not None
                     all_register_states.append(r)
-
-                # Early stopping at eval time
-                if not self.training:
-                    # Exit if *all* samples in batch want to exit
-                    if (exit_prob_t > exit_threshold).all():
-                        break
 
         return {
             "logits": all_logits,

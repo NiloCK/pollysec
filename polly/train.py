@@ -40,7 +40,9 @@ DEFAULT_BATCH_SIZE = 128
 DEFAULT_WEIGHT_DECAY = 0.01
 DEFAULT_BETAS = (0.9, 0.999)
 DEFAULT_MAX_GRAD_NORM = 1.0
-DEFAULT_GATE_LAMBDA = 0.01
+DEFAULT_GATE_LAMBDA = 0.01          # (legacy; unused under PonderNet loss)
+DEFAULT_PONDER_LAMBDA_P = 0.3       # geometric prior param — E[t_exit] ≈ 1/λ_p
+DEFAULT_PONDER_BETA = 0.01          # weight on KL(exit_dist || geometric prior)
 
 CHECKPOINT_EVERY = 2_000
 LOG_EVERY = 100
@@ -135,23 +137,16 @@ def compute_exit_distribution(exit_probs: List[torch.Tensor]) -> torch.Tensor:
     return exit_dist
 
 
-def compute_gate_entropy_loss(
-    exit_probs: List[torch.Tensor],
-    lam: float = DEFAULT_GATE_LAMBDA,
-) -> torch.Tensor:
-    """
-    Entropy bonus on the exit distribution.
-    L_gate = -λ * H(exit_distribution)
+def geometric_prior(lambda_p: float, T: int, device: torch.device) -> torch.Tensor:
+    """Truncated geometric prior over iterations 1..T.
 
-    We *minimise* L_gate, so negative entropy = encourages higher entropy.
+    p(t) ∝ (1 - λ_p)^(t-1) · λ_p, renormalised so Σ_t p(t) = 1.
+    E[t] ≈ 1/λ_p (exact in the untruncated limit). Used by PonderNet-style
+    KL regularisation to set the target average compute budget.
     """
-    exit_dist = compute_exit_distribution(exit_probs)
-    # Clamp for numerical stability in log
-    exit_dist = exit_dist.clamp(min=1e-8)
-    # H = -sum p log p  (per example, then mean over batch)
-    entropy = -(exit_dist * exit_dist.log()).sum(dim=-1)  # (batch,)
-    # We want to *maximise* entropy, so loss = -λ * H
-    return -lam * entropy.mean()
+    t = torch.arange(T, device=device, dtype=torch.float32)
+    p = ((1.0 - lambda_p) ** t) * lambda_p
+    return p / p.sum()
 
 
 def compute_loss(
@@ -173,19 +168,35 @@ def compute_loss(
         task_loss = F.cross_entropy(logits_list[0], labels)
         return task_loss, task_loss
 
-    # Looped: weighted multi-iteration loss
+    # Looped: PonderNet-style objective.
+    #   task_loss = E_{t ~ exit_dist}[ CE(logits_t, y) ]
+    #   kl_loss   = KL(exit_dist || Geometric(λ_p))
+    #   total     = task_loss + β · kl_loss
+    # The geometric prior encodes "prefer exiting earlier, but keep some mass on
+    # longer computations for hard inputs." Expected exit iter ≈ 1/λ_p.
     T = len(logits_list)
-    weights = compute_iteration_weights(T)
+    device = labels.device
 
-    task_loss = torch.tensor(0.0, device=labels.device)
-    for ell, (logits, w) in enumerate(zip(logits_list, weights)):
-        task_loss = task_loss + w * F.cross_entropy(logits, labels)
+    # (B, T) stack of per-iteration CE losses
+    ce_per_iter = torch.stack(
+        [F.cross_entropy(logits, labels, reduction="none") for logits in logits_list],
+        dim=1,
+    )
 
-    # Exit gate regularisation
     exit_probs: List[torch.Tensor] = outputs["exit_probs"]
-    gate_loss = compute_gate_entropy_loss(exit_probs)
+    exit_dist = compute_exit_distribution(exit_probs)  # (B, T), rows sum to 1
 
-    total_loss = task_loss + gate_loss
+    task_loss = (exit_dist * ce_per_iter).sum(dim=1).mean()
+
+    prior = geometric_prior(DEFAULT_PONDER_LAMBDA_P, T, device)   # (T,)
+    prior = prior.unsqueeze(0).expand_as(exit_dist)               # (B, T)
+    kl_loss = F.kl_div(
+        exit_dist.clamp(min=1e-8).log(),
+        prior,
+        reduction="batchmean",
+    )
+
+    total_loss = task_loss + DEFAULT_PONDER_BETA * kl_loss
     return total_loss, task_loss
 
 

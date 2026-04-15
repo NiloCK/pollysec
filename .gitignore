@@ -24,7 +24,7 @@ kaggle_output/
 
 # Data splits (reproducible from data.py, but small enough to commit)
 # Uncomment to ignore:
-# polly/data/*.jsonl
+polly/data/**/*.jsonl
 
 # IDE / editor
 .idea/

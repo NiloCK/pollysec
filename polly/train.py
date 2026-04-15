@@ -54,9 +54,9 @@ DEFAULT_PONDER_BETA_MAX = 0.01      # final β value
 DEFAULT_PONDER_BETA_WARMUP = 3_000  # steps of β=0 before linear ramp
 DEFAULT_PONDER_BETA_RAMP = 2_000    # steps to linearly ramp β from 0 to BETA_MAX
 
-CHECKPOINT_EVERY = 2_000
-LOG_EVERY = 100
-VAL_EVERY = 1_000
+CHECKPOINT_EVERY = int(os.environ.get("POLLY_CHECKPOINT_EVERY", 2_000))
+LOG_EVERY = int(os.environ.get("POLLY_LOG_EVERY", 100))
+VAL_EVERY = int(os.environ.get("POLLY_VAL_EVERY", 1_000))
 
 DATA_DIR = Path(os.environ.get("POLLY_DATA_DIR", Path(__file__).resolve().parent / "data"))
 CHECKPOINT_DIR = Path(os.environ.get("POLLY_CHECKPOINT_DIR", Path(__file__).resolve().parent / "checkpoints"))
@@ -357,7 +357,8 @@ def run_validation(
     depth_correct: Dict[int, int] = {}
     depth_count: Dict[int, int] = {}
 
-    use_amp = device.type == "cuda"
+    # See training-loop comment: fp16 overflows for looped variants.
+    use_amp = device.type == "cuda" and variant == "vanilla"
 
     for batch in val_loader:
         input_ids = batch[0].to(device)
@@ -525,7 +526,11 @@ def train(
     )
 
     # ----- AMP scaler -----
-    use_amp = device.type == "cuda"
+    # fp16 autocast overflows for looped variants: 24 layer-applications
+    # (4 iters × 6 layers) with per-layer register injection blow past fp16's
+    # ~65k dynamic range, producing NaN logits. Gate amp to vanilla only until
+    # we either bf16 (needs newer GPU than P100) or norm the register path.
+    use_amp = device.type == "cuda" and variant == "vanilla"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ----- Training state -----
@@ -787,11 +792,40 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_PONDER_BETA_RAMP,
         help="Steps for β to linearly ramp from 0 to beta-max.",
     )
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Smoke-test mode: 25 steps, batch 8, log every 5, no val/ckpt. "
+             "Overrides --steps/--batch-size/--device unless explicitly set.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
+    global LOG_EVERY, VAL_EVERY, CHECKPOINT_EVERY
     args = parse_args()
+
+    if args.smoke:
+        # Tight cadence so a 25-step run is observable.
+        LOG_EVERY = 5
+        VAL_EVERY = 10**9
+        CHECKPOINT_EVERY = 10**9
+        # Only override user-settable defaults if they weren't explicitly set.
+        if args.steps == DEFAULT_TOTAL_STEPS:
+            args.steps = 25
+        if args.batch_size == DEFAULT_BATCH_SIZE:
+            args.batch_size = 8
+        if args.device == "auto":
+            args.device = "cpu"
+        # Shorter β warmup so smoke exercises the KL code path if requested
+        # via ponder mode (still zero during the 25-step window, but visible).
+        if args.beta_warmup == DEFAULT_PONDER_BETA_WARMUP:
+            args.beta_warmup = 10
+        if args.beta_ramp == DEFAULT_PONDER_BETA_RAMP:
+            args.beta_ramp = 10
+        print(f"[smoke] steps={args.steps} batch={args.batch_size} "
+              f"device={args.device} log_every={LOG_EVERY}")
+
     train(
         variant=args.variant,
         seed=args.seed,

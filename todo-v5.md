@@ -1,5 +1,7 @@
 # Polly v5 — Encoder / Interpreter / Decoder refactor
 
+> **Status 2026-04-15:** Phase A complete. Ready for Kaggle dataset push + kernel push (Phase B.1, C.1–C.2).
+
 > Supersedes `todo-v4.md`. Spawned 2026-04-15 after v4 C.1 runs showed
 > looped_reg unable to beat vanilla under either ponder or uniform loss.
 > Legend: `[ ]` todo · `[~]` in progress · `[x]` done · `[!]` blocked/decision needed
@@ -149,35 +151,51 @@ baseline; partitioning is irrelevant for a single pass.
 
 ## Phase A — Refactor
 
-- [ ] **A.1** `polly/model.py`
-  - [ ] Introduce `N_ENCODER=2`, `N_INTERPRETER=3`, `N_DECODER=1` constants
+- [x] **A.1** `polly/model.py`
+  - [x] Introduce `N_ENCODER=2`, `N_INTERPRETER=3`, `N_DECODER=1` constants
         (`N_LAYERS = 6` retained as sum).
-  - [ ] Split `self.layers` into `self.encoder_layers`, `self.interpreter_layers`,
+  - [x] Split `self.layers` into `self.encoder_layers`, `self.interpreter_layers`,
         `self.decoder_layers`.
-  - [ ] `vanilla` path: run all 6 layers sequentially (encoder+interpreter+decoder)
+  - [x] `vanilla` path: run all 6 layers sequentially (encoder+interpreter+decoder)
         as a single pass. No behavioural change vs v4 vanilla.
-  - [ ] Looped path:
-    - [ ] Embed → encoder (once) → `h_0`.
-    - [ ] For `t in 1..T`: `h_t = interpreter(h_{t-1}, r_{t-1})`; compute
+  - [x] Looped path:
+    - [x] Embed → encoder (once) → `h_0`.
+    - [x] For `t in 1..T`: `h_t = interpreter(h_{t-1}, r_{t-1})`; compute
           `p_t` from `h_t`; **training**: `logits_t = decoder_then_head(h_t)`.
-    - [ ] **Inference**: pick `t*` by threshold; run decoder once on `h_{t*}`.
-  - [ ] Restrict register inject/update to interpreter layers only.
-  - [ ] Rewrite `forward()` return: `{"logits": [...], "exit_probs": [...],
+    - [x] **Inference**: pick `t*` by threshold; run decoder once on `h_{t*}`.
+  - [x] Restrict register inject/update to interpreter layers only.
+  - [x] Rewrite `forward()` return: `{"logits": [...], "exit_probs": [...],
         "register_states": [...], "hidden_states": [...]}` — `hidden_states`
         collects `h_t` (interpreter outputs) for probing (D.2).
-  - [ ] Update `_init_weights`; keep exit-gate zero-init.
+  - [x] Update `_init_weights`; keep exit-gate zero-init.
 
-- [ ] **A.2** `polly/train.py`
-  - [ ] `compute_loss` keeps existing ponder math — interface shouldn't need
-        to change if model still returns `logits` list + `exit_probs` list.
-  - [ ] Re-confirm β warmup / λ_p defaults; raise `λ_p` default to 0.1.
-  - [ ] Drop `uniform` loss mode? Keep it as a fallback flag but ponder is
-        the v5 path.
+- [x] **A.2** `polly/train.py`
+  - [x] `compute_loss` keeps existing ponder math — interface unchanged,
+        model still returns `logits` list + `exit_probs` list.
+  - [x] Re-confirm β warmup / λ_p defaults; raised `λ_p` default to 0.1.
+  - [x] `uniform` loss mode kept as fallback flag; ponder is the v5 path.
+  - [x] `compute_grad_norms` updated for new layer names — returns
+        `(total_norm, {"encoder": [...], "interpreter": [...], "decoder": [...]})`
+        instead of flat list of 6.
+  - [x] AMP comment updated (18 layer-applications vs 24).
 
-- [ ] **A.3** Smoke-test locally: `--smoke` run on all three variants,
-      verify shapes, no NaN, loss decreases.
+  Also updated:
+  - [x] `polly/probe.py` — `extract_representations()` uses new layer groups.
+  - [x] `polly/ablate.py` — `ablated_forward()` uses new layer groups.
+  - [x] `kaggle/run_kaggle.py` — `VARIANTS=["vanilla","looped_reg"]`,
+        `loss_mode="ponder"`, `lambda_p=0.1`.
 
-- [ ] **A.4** Checkpoint compatibility: old v4 checkpoints won't load. OK —
+- [x] **A.3** Smoke-test locally: `--smoke` run on all three variants,
+      verify shapes, no NaN, loss decreases. Results:
+      - `vanilla`:    313,920 params, loss moving, 2.6 steps/s (CPU). ✅
+      - `looped`:     313,985 params, loss moving, 0.5 steps/s (CPU). ✅
+      - `looped_reg`: 317,097 params, loss moving, 0.6 steps/s (CPU). ✅
+      - `exit_dist_mean` starts at [0.50, 0.25, 0.125, 0.125] — correct
+        geometric decay from sigmoid(0)=0.5 init.
+      - `per_iter_ce` varies across iterations — NOT collapsed to identity.
+      - `grad_norm_per_group` shows gradient flowing through all partitions.
+
+- [x] **A.4** Checkpoint compatibility: old v4 checkpoints won't load. OK —
       we need fresh training anyway. Archive v4 checkpoints under
       `kaggle_output/checkpoints/v4/` if anyone wants them later.
 
@@ -189,7 +207,7 @@ DG-1 (length cap confounding d≥5) was fixed by bumping `MAX_SEQ_LEN` to 256
 and `max_tokens` to 248. Data has been regenerated locally.
 
 - [ ] **B.1** Re-push dataset to Kaggle (`kaggle datasets version` on
-      `pollysec-pkg`).
+      `pollysec-pkg`). **← USER ACTION: next step.**
 - [ ] **B.2** Spot-check: d=6 train.jsonl examples should have mean token
       length substantially greater than d=4 (verified locally: 167 vs 70).
 
@@ -197,7 +215,7 @@ and `max_tokens` to 248. Data has been regenerated locally.
 
 ## Phase C — Training runs (staged)
 
-- [ ] **C.1** `vanilla` baseline, seed 100, 10k steps, well-formed d=6 data.
+- [ ] **C.1** `vanilla` baseline, seed 100, 10k steps, well-formed d=6 data. **← runs after B.1 push.**
       Re-establishes the capability ceiling on the post-DG-1 data (old v4
       vanilla result used length-capped data — not directly comparable to
       v5 looped_reg on fixed data). Kaggle P100, ~40min.
@@ -253,10 +271,10 @@ interpreter outputs are unambiguously working-state:
 
 ## Kaggle handoff checklist
 
-1. Refactor model.py per Phase A.
-2. Local `--smoke` on all three variants.
-3. `kaggle datasets version` — push DG-1-fixed data.
-4. Update `kaggle/run_kaggle.py`: `VARIANTS = ["vanilla", "looped_reg"]`,
-   `SEEDS = [100]`, `STEPS = 10_000`, `loss_mode = "ponder"`.
-5. `kaggle kernels push` pollysec-train.
+1. ~~Refactor model.py per Phase A.~~ ✅ Done.
+2. ~~Local `--smoke` on all three variants.~~ ✅ Done.
+3. `kaggle datasets version` — push DG-1-fixed data. **← YOU ARE HERE**
+4. ~~Update `kaggle/run_kaggle.py`~~ ✅ Done: `VARIANTS = ["vanilla", "looped_reg"]`,
+   `SEEDS = [100]`, `STEPS = 10_000`, `loss_mode = "ponder"`, `lambda_p = 0.1`.
+5. `kaggle kernels push` pollysec-train. **← after step 3**
 6. Monitor; pull output; record in `results/runs.md` under a v5 C.1 block.

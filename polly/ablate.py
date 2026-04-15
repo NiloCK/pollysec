@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset
 
 from polly.data import BracketDataset
-from polly.model import BracketTransformer, REG_DIM, DIM
+from polly.model import BracketTransformer, REG_DIM, DIM, NUM_CLASSES
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -112,8 +112,8 @@ def ablated_forward(
 ) -> torch.Tensor:
     """Run the looped_reg forward pass with an ablation applied to the register.
 
-    This manually reimplements the forward loop so we can intervene on `r`
-    between iterations.
+    This manually reimplements the v5 forward loop (encoder → interpreter×T →
+    decoder) so we can intervene on `r` between interpreter iterations.
 
     Args:
         model:          A trained BracketTransformer(variant="looped_reg").
@@ -124,7 +124,7 @@ def ablated_forward(
         t_max:          Number of loop iterations.
 
     Returns:
-        logits from the final iteration — (B, 2).
+        logits from the final iteration — (B, NUM_CLASSES).
     """
     assert model.variant == VARIANT, f"Expected {VARIANT}, got {model.variant}"
 
@@ -134,23 +134,22 @@ def ablated_forward(
     # Embedding (same as model._embed)
     h = model._embed(input_ids)  # (B, S, D)
 
+    # --- Encoder (single pass, no register, no ablation) ---
+    for layer in model.encoder_layers:
+        h = layer(h, attention_mask=attention_mask)
+
     # Initialise register
     r = torch.zeros(B, REG_DIM, device=device)
 
     r_frozen: Optional[torch.Tensor] = None  # saved after iter 1 for "freeze"
-    final_logits: Optional[torch.Tensor] = None
 
+    # --- Interpreter (looped T times, register fires here) ---
     for t in range(t_max):
-        # --- Run all layers with register inject/update ---
-        # This mirrors model._run_layers but we keep the same r reference
-        for layer in model.layers:
+        for layer in model.interpreter_layers:
             h = model.register_mech.inject(h, r)
             h = layer(h, attention_mask=attention_mask)
             h_cls = h[:, 0, :]
             r = model.register_mech.update(h_cls, r)
-
-        # Compute logits for this iteration (use last iter's)
-        final_logits = model._compute_logits(h)
 
         # --- Apply ablation BETWEEN iterations (before next iter uses r) ---
         if t < t_max - 1:  # no need to ablate after the last iteration
@@ -173,7 +172,12 @@ def ablated_forward(
             else:
                 raise ValueError(f"Unknown ablation_type: {ablation_type!r}")
 
-    assert final_logits is not None
+    # --- Decoder (single pass on final interpreter output) ---
+    h_dec = h
+    for layer in model.decoder_layers:
+        h_dec = layer(h_dec, attention_mask=attention_mask)
+
+    final_logits = model._compute_logits(h_dec)  # (B, NUM_CLASSES)
     return final_logits
 
 

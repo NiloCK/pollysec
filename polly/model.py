@@ -1,14 +1,27 @@
 """
 Polly transformer — three model variants for ListOps experiments.
 
-Variants (controlled by `variant` parameter):
-  "vanilla"      — Standard 6-layer transformer, single pass (baseline)
-  "looped"       — 6 weight-tied layers applied T times, with exit gate
-  "looped_reg"   — Looped + register mechanism carried across iterations
+v5 architecture: Encoder / Interpreter / Decoder split.
 
-Dropped in v4: "vanilla_reg" — not scientifically interesting under the
-scaffolding reframe (registers without looping have no cross-iteration
-state to scaffold).
+Variants (controlled by `variant` parameter):
+  "vanilla"      — Standard 6-layer transformer, single pass (baseline).
+                   Layers are semantically split (2 enc + 3 interp + 1 dec)
+                   but run as a flat single pass — no behavioural change vs v4.
+  "looped"       — Encoder (2, once) → Interpreter (3, weight-tied × T) →
+                   Decoder (1, per-iter at train / once at inference). Exit gate.
+  "looped_reg"   — Looped + register mechanism, restricted to interpreter block.
+
+The key v5 insight: under v4's single shared stack, the residual stream after
+the last layer had to serve two contradictory roles — decodable (output head
+reads it) AND re-encodable (layer 1 of the next iteration consumes it).  This
+dual-role pressure caused both ponder-loss collapse (exit_dist → iter 1) and
+uniform-loss collapse (fixed-point identity across iterations).
+
+v5 fixes this by partitioning layers by role:
+  - Encoder prepares structural features (runs once).
+  - Interpreter is the looped core, operating in pure working-state space.
+  - Decoder maps interpreter state to answer space (separate weights).
+Interpreter weights never see "decode this as a digit" gradient.
 """
 
 from __future__ import annotations
@@ -34,7 +47,6 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (..., dim)
         rms = x.float().pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         return (x.float() * rms).to(x.dtype) * self.weight
 
@@ -47,7 +59,7 @@ class TransformerLayer(nn.Module):
         assert dim % n_heads == 0
         self.dim = dim
         self.n_heads = n_heads
-        self.head_dim = dim // n_heads  # 16
+        self.head_dim = dim // n_heads
 
         # --- attention ---
         self.attn_norm = RMSNorm(dim, eps=eps)
@@ -62,33 +74,24 @@ class TransformerLayer(nn.Module):
         self.ffn_down = nn.Linear(ffn_dim, dim, bias=False)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor | None = None) -> torch.Tensor:
-        """
-        Args:
-            x: (B, S, D)
-            attention_mask: (B, S) — 1 for real tokens, 0 for PAD.
-                            Converted to additive mask for softmax.
-        Returns:
-            (B, S, D)
-        """
         B, S, D = x.shape
 
         # ---------- self-attention ----------
         h = self.attn_norm(x)
-        q = self.q_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)  # (B, H, S, Dh)
+        q = self.q_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(h).view(B, S, self.n_heads, self.head_dim).transpose(1, 2)
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B, H, S, S)
+        scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)
 
         if attention_mask is not None:
-            # attention_mask: (B, S) → (B, 1, 1, S)  — mask out PAD *keys*
-            pad_mask = attention_mask[:, None, None, :]  # 1=keep, 0=mask
+            pad_mask = attention_mask[:, None, None, :]
             scores = scores.masked_fill(pad_mask == 0, float("-inf"))
 
         attn = F.softmax(scores, dim=-1)
-        attn = attn.masked_fill(attn.isnan(), 0.0)  # all-PAD rows → 0
+        attn = attn.masked_fill(attn.isnan(), 0.0)
 
-        out = torch.matmul(attn, v)  # (B, H, S, Dh)
+        out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         out = self.o_proj(out)
 
@@ -102,19 +105,17 @@ class TransformerLayer(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Register mechanism (used by looped_reg)
+# Register mechanism (looped_reg only — restricted to interpreter block)
 # ---------------------------------------------------------------------------
 
 class RegisterMechanism(nn.Module):
     """
     Maintains a register vector r ∈ ℝ^reg_dim that is:
-      • *injected* into the hidden states before each transformer layer
-      • *updated* from (h_cls, r) after each transformer layer
+      • *injected* into the hidden states before each interpreter layer
+      • *updated* from (h_cls, r) after each interpreter layer
 
-    The register is a dedicated low-resistance channel for cross-iteration
-    state. Under the v4 reframe, it scaffolds recursive control flow —
-    the scientific claim rests on probing evidence (D.2), not on
-    architectural exclusivity.
+    Under v5, the register fires ONLY inside the interpreter block.
+    It is not present in encoder or decoder layers.
     """
 
     def __init__(self, hidden_dim: int = 64, reg_dim: int = 8, mlp_mid: int = 32):
@@ -130,11 +131,11 @@ class RegisterMechanism(nn.Module):
 
     def inject(self, h: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         """h: (B, S, D), r: (B, reg_dim) → h + proj(r) broadcast over S."""
-        return h + self.inject_proj(r).unsqueeze(1)  # (B, 1, D)
+        return h + self.inject_proj(r).unsqueeze(1)
 
     def update(self, h_cls: torch.Tensor, r: torch.Tensor) -> torch.Tensor:
         """h_cls: (B, D), r: (B, reg_dim) → updated r (with residual)."""
-        inp = torch.cat([h_cls, r], dim=-1)  # (B, D + reg_dim)
+        inp = torch.cat([h_cls, r], dim=-1)
         return r + self.update_fc2(F.silu(self.update_fc1(inp)))
 
 
@@ -150,22 +151,37 @@ MAX_SEQ_LEN = 256    # budget for ListOps expressions; bumped from 128 to lift D
 DIM = 64
 N_HEADS = 4
 FFN_DIM = 256
-N_LAYERS = 6
 REG_DIM = 8
 NUM_CLASSES = 10     # ListOps output: single digit 0-9
+
+# v5 layer partition
+N_ENCODER = 2
+N_INTERPRETER = 3
+N_DECODER = 1
+N_LAYERS = N_ENCODER + N_INTERPRETER + N_DECODER  # 6 total (same param budget as v4)
 
 
 class PollyTransformer(nn.Module):
     """
-    Unified transformer for ListOps, supporting three variants:
-      - vanilla:    standard 6-layer, single pass (baseline)
-      - looped:     6 weight-tied layers × T iterations, exit gate
-      - looped_reg: looped + cross-iteration register mechanism
+    Unified transformer for ListOps, supporting three variants.
+
+    v5 architecture: layers are partitioned by role.
+
+      - Encoder (2 layers): single pass, transforms embedded input into
+        structural features.
+      - Interpreter (3 layers, weight-tied across T iterations): the looped
+        core.  Register fires here only (if looped_reg).
+      - Decoder (1 layer): single pass per logits computation, maps
+        interpreter state to answer space.
+
+    For vanilla, all 6 layers run as a flat single pass (enc → interp → dec).
+    No looping, no gate, no register.  Behavioural equivalent of v4 vanilla.
 
     Forward returns a dict:
         logits          — list of (B, NUM_CLASSES) tensors, one per iteration
         exit_probs      — list of (B,) tensors (empty for vanilla)
-        register_states — list of (B, REG_DIM) tensors (empty for vanilla/looped)
+        register_states — list of (B, REG_DIM) tensors (empty unless looped_reg)
+        hidden_states   — list of (B, S, DIM) interpreter outputs h_t (empty for vanilla)
     """
 
     def __init__(self, variant: str = "vanilla"):
@@ -180,18 +196,25 @@ class PollyTransformer(nn.Module):
         self.tok_emb = nn.Embedding(VOCAB_SIZE, DIM)
         self.pos_emb = nn.Embedding(MAX_SEQ_LEN, DIM)
 
-        # ---- transformer layers ----
-        # For looped variants the same N_LAYERS are reused across iterations.
-        self.layers = nn.ModuleList([
+        # ---- transformer layers (split by role) ----
+        self.encoder_layers = nn.ModuleList([
             TransformerLayer(dim=DIM, n_heads=N_HEADS, ffn_dim=FFN_DIM)
-            for _ in range(N_LAYERS)
+            for _ in range(N_ENCODER)
+        ])
+        self.interpreter_layers = nn.ModuleList([
+            TransformerLayer(dim=DIM, n_heads=N_HEADS, ffn_dim=FFN_DIM)
+            for _ in range(N_INTERPRETER)
+        ])
+        self.decoder_layers = nn.ModuleList([
+            TransformerLayer(dim=DIM, n_heads=N_HEADS, ffn_dim=FFN_DIM)
+            for _ in range(N_DECODER)
         ])
 
         # ---- output head (RMSNorm → Linear) ----
         self.out_norm = RMSNorm(DIM)
         self.out_head = nn.Linear(DIM, NUM_CLASSES, bias=False)
 
-        # ---- register (looped_reg only) ----
+        # ---- register (looped_reg only, restricted to interpreter) ----
         if self.has_register:
             self.register_mech = RegisterMechanism(hidden_dim=DIM, reg_dim=REG_DIM)
 
@@ -215,13 +238,7 @@ class PollyTransformer(nn.Module):
             elif isinstance(module, RMSNorm):
                 nn.init.ones_(module.weight)
 
-        # Exit-gate init: neutral (sigmoid(0) = 0.5). Under PonderNet-style
-        # loss the KL to a geometric prior shapes the exit distribution.
-        # NOTE (B.3 audit): with weight=0, bias=0, init exit prob is 0.5 at
-        # every iteration, yielding a geometric-decaying exit_dist that
-        # front-loads mass on iter 1. Combined with a front-loaded prior
-        # (λ_p=0.3), this was identified as the primary cause of v3's
-        # exit-collapse. Fix applied in train.py: β-warmup and smaller λ_p.
+        # Exit-gate init: neutral (sigmoid(0) = 0.5).
         if self.is_looped:
             nn.init.zeros_(self.exit_gate.weight)
             nn.init.zeros_(self.exit_gate.bias)
@@ -233,48 +250,62 @@ class PollyTransformer(nn.Module):
         positions = torch.arange(S, device=input_ids.device).unsqueeze(0).expand(B, S)
         return self.tok_emb(input_ids) + self.pos_emb(positions)
 
-    def _run_layers(
+    def _run_encoder(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Run encoder layers (single pass, no register). Returns h_0."""
+        for layer in self.encoder_layers:
+            h = layer(h, attention_mask=attention_mask)
+        return h
+
+    def _run_interpreter_once(
         self,
         h: torch.Tensor,
         attention_mask: torch.Tensor,
         r: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, list[torch.Tensor]]:
-        """Run all N_LAYERS once, optionally with register inject/update.
+        """Run interpreter layers once (one iteration of the loop).
+
+        Register inject/update fires here if variant == looped_reg.
 
         Returns (h, r, reg_snapshots) where reg_snapshots collects r after
-        each layer update (for diagnostics / probing — not used in loss).
+        each layer update (for diagnostics / probing).
         """
         reg_snapshots: list[torch.Tensor] = []
-        for layer in self.layers:
-            # --- register injection (before layer) ---
+        for layer in self.interpreter_layers:
             if self.has_register:
                 assert r is not None
                 h = self.register_mech.inject(h, r)
 
-            # --- transformer layer ---
             h = layer(h, attention_mask=attention_mask)
 
-            # --- register update (after layer) ---
             if self.has_register:
                 assert r is not None
-                h_cls = h[:, 0, :]  # CLS is position 0
+                h_cls = h[:, 0, :]
                 r = self.register_mech.update(h_cls, r)
                 reg_snapshots.append(r)
 
         return h, r, reg_snapshots
 
+    def _run_decoder(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        """Run decoder layers (single pass, no register). Returns decoded h."""
+        for layer in self.decoder_layers:
+            h = layer(h, attention_mask=attention_mask)
+        return h
+
     def _compute_logits(self, h: torch.Tensor) -> torch.Tensor:
         """Output head: RMSNorm on CLS hidden → linear → (B, NUM_CLASSES)."""
-        cls_h = h[:, 0, :]  # (B, D)
+        cls_h = h[:, 0, :]
         return self.out_head(self.out_norm(cls_h))
 
     def _compute_exit_prob(self, h: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-        """Exit gate: mean-pool (masking PAD) → Linear → sigmoid → (B,)."""
-        # Mask: (B, S, 1)
+        """Exit gate: mean-pool interpreter state (masking PAD) → sigmoid → (B,).
+
+        Semantics: "has the interpreter cooked enough?" — reads interpreter
+        output BEFORE decoder.
+        """
         mask = attention_mask.unsqueeze(-1).float()
-        lengths = mask.sum(dim=1)  # (B, 1)
-        pooled = (h * mask).sum(dim=1) / lengths.clamp(min=1)  # (B, D)
-        return torch.sigmoid(self.exit_gate(pooled)).squeeze(-1)  # (B,)
+        lengths = mask.sum(dim=1)
+        pooled = (h * mask).sum(dim=1) / lengths.clamp(min=1)
+        return torch.sigmoid(self.exit_gate(pooled)).squeeze(-1)
 
     # -------------------------------------------------------------- forward
     def forward(
@@ -292,14 +323,16 @@ class PollyTransformer(nn.Module):
             exit_threshold: p_exit threshold for early stopping at eval time.
 
         Returns dict with keys:
-            logits          — list[Tensor(B, 10)]  one per iteration
-            exit_probs      — list[Tensor(B,)]     one per iteration (empty for vanilla)
-            register_states — list[Tensor(B, 8)]    one per iteration (empty for vanilla/looped)
+            logits          — list[Tensor(B, 10)]   one per iteration
+            exit_probs      — list[Tensor(B,)]      one per iteration (empty for vanilla)
+            register_states — list[Tensor(B, 8)]    one per iteration (empty unless looped_reg)
+            hidden_states   — list[Tensor(B, S, 64)] interpreter output h_t per iter
+                              (empty for vanilla)
         """
         B = input_ids.size(0)
         device = input_ids.device
 
-        h = self._embed(input_ids)  # (B, S, D)
+        h = self._embed(input_ids)
 
         # Initialise register to zeros if needed
         r: torch.Tensor | None = None
@@ -309,25 +342,41 @@ class PollyTransformer(nn.Module):
         all_logits: list[torch.Tensor] = []
         all_exit_probs: list[torch.Tensor] = []
         all_register_states: list[torch.Tensor] = []
+        all_hidden_states: list[torch.Tensor] = []
 
         if not self.is_looped:
-            # -------- single-pass variant (vanilla) --------
-            h, r, _ = self._run_layers(h, attention_mask, r)
+            # -------- vanilla: flat single pass (enc → interp → dec) --------
+            # No looping, no gate, no register.  Behaviourally identical to
+            # v4 vanilla — 6 layers in sequence.
+            h = self._run_encoder(h, attention_mask)
+            h, _, _ = self._run_interpreter_once(h, attention_mask, r)
+            h = self._run_decoder(h, attention_mask)
             all_logits.append(self._compute_logits(h))
         else:
-            # -------- looped variants (looped, looped_reg) --------
-            # All T iterations always compute. Per-sample exit selection
-            # happens downstream (evaluate.py picks logits from each
-            # sample's exit iter). This keeps forward batched and avoids
-            # ragged shapes.
+            # -------- looped variants --------
+            # Encoder: single pass
+            h = self._run_encoder(h, attention_mask)
+
+            # Interpreter: T iterations (weight-tied)
+            # All iterations always run.  Per-sample exit selection is
+            # downstream (evaluate.py picks logits from each sample's
+            # exit iter).
             for t in range(t_max):
-                h, r, _ = self._run_layers(h, attention_mask, r)
+                h, r, _ = self._run_interpreter_once(h, attention_mask, r)
 
-                logits_t = self._compute_logits(h)
-                all_logits.append(logits_t)
+                # Record interpreter output (before decoder) for probing
+                all_hidden_states.append(h)
 
+                # Exit gate reads interpreter state (not decoded state)
                 exit_prob_t = self._compute_exit_prob(h, attention_mask)
                 all_exit_probs.append(exit_prob_t)
+
+                # Decoder + output head.  At training time: runs on every
+                # iteration (cheap — 1 layer).  Decoder gets a fresh view
+                # of h; it does NOT modify h for the next iteration.
+                h_decoded = self._run_decoder(h, attention_mask)
+                logits_t = self._compute_logits(h_decoded)
+                all_logits.append(logits_t)
 
                 if self.has_register:
                     assert r is not None
@@ -337,6 +386,7 @@ class PollyTransformer(nn.Module):
             "logits": all_logits,
             "exit_probs": all_exit_probs,
             "register_states": all_register_states,
+            "hidden_states": all_hidden_states,
         }
 
     # -------------------------------------------------------------- utility
@@ -346,7 +396,8 @@ class PollyTransformer(nn.Module):
 
     def extra_repr(self) -> str:
         return (
-            f"variant={self.variant!r}, dim={DIM}, layers={N_LAYERS}, "
+            f"variant={self.variant!r}, dim={DIM}, "
+            f"encoder={N_ENCODER}, interpreter={N_INTERPRETER}, decoder={N_DECODER}, "
             f"heads={N_HEADS}, num_classes={NUM_CLASSES}, "
             f"params={self.count_parameters():,}"
         )

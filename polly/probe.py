@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, ConcatDataset
 
 from polly.data import BracketDataset
-from polly.model import BracketTransformer, DIM, REG_DIM, N_LAYERS
+from polly.model import BracketTransformer, DIM, REG_DIM, NUM_CLASSES, N_LAYERS
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -100,10 +100,13 @@ def extract_representations(
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
     """Run the looped_reg forward pass manually, collecting intermediates.
 
+    v5 architecture: Encoder (single pass) → Interpreter (looped T times,
+    register fires here) → Decoder (single pass, for logits).
+
     Returns:
-        h_cls_per_iter:  list of T tensors, each (B, DIM)   — CLS hidden after iteration t
-        r_per_iter:      list of T tensors, each (B, REG_DIM) — register after iteration t
-        logits_per_iter: list of T tensors, each (B, 2)     — logits after iteration t
+        h_cls_per_iter:  list of T tensors, each (B, DIM)        — CLS hidden after interpreter iteration t
+        r_per_iter:      list of T tensors, each (B, REG_DIM)    — register after interpreter iteration t
+        logits_per_iter: list of T tensors, each (B, NUM_CLASSES) — logits after decoder at iteration t
     """
     assert model.variant == VARIANT, f"Expected {VARIANT}, got {model.variant}"
 
@@ -113,6 +116,10 @@ def extract_representations(
     # Embed
     h = model._embed(input_ids)  # (B, S, D)
 
+    # --- Encoder (single pass, no register) ---
+    for layer in model.encoder_layers:
+        h = layer(h, attention_mask=attention_mask)
+
     # Initialise register to zeros
     r = torch.zeros(B, REG_DIM, device=device)
 
@@ -121,23 +128,23 @@ def extract_representations(
     logits_per_iter: List[torch.Tensor] = []
 
     for _t in range(t_max):
-        # Run all N_LAYERS (replicating _run_layers with register)
-        for layer in model.layers:
-            # Register injection
+        # --- Interpreter layers (register inject/update fires here) ---
+        for layer in model.interpreter_layers:
             h = model.register_mech.inject(h, r)
-            # Transformer layer
             h = layer(h, attention_mask=attention_mask)
-            # Register update
             h_cls_layer = h[:, 0, :]  # (B, D)
             r = model.register_mech.update(h_cls_layer, r)
 
-        # Collect CLS hidden state after this full iteration
+        # Collect CLS hidden state after this interpreter iteration
         cls_h = h[:, 0, :]  # (B, D)
         h_cls_per_iter.append(cls_h.cpu())
         r_per_iter.append(r.cpu())
 
-        # Collect logits
-        logits_t = model.out_head(model.out_norm(cls_h))  # (B, 2)
+        # --- Decoder (single pass, no register) → logits ---
+        h_dec = h
+        for layer in model.decoder_layers:
+            h_dec = layer(h_dec, attention_mask=attention_mask)
+        logits_t = model._compute_logits(h_dec)  # (B, NUM_CLASSES)
         logits_per_iter.append(logits_t.cpu())
 
     return h_cls_per_iter, r_per_iter, logits_per_iter

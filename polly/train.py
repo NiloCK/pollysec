@@ -48,8 +48,8 @@ DEFAULT_MAX_GRAD_NORM = 1.0
 DEFAULT_GATE_LAMBDA = 0.01          # (legacy; unused under PonderNet loss)
 
 # PonderNet loss parameters (Phase B.2)
-DEFAULT_PONDER_LAMBDA_P = 0.05      # geometric prior param — was 0.3 in v3
-                                     # E[t]≈20 untruncated, ~85% on t=4 when T=4
+DEFAULT_PONDER_LAMBDA_P = 0.1       # geometric prior param — was 0.05 in v4, 0.3 in v3
+                                     # Start at λ_p = 0.1 for v5
 DEFAULT_PONDER_BETA_MAX = 0.01      # final β value
 DEFAULT_PONDER_BETA_WARMUP = 3_000  # steps of β=0 before linear ramp
 DEFAULT_PONDER_BETA_RAMP = 2_000    # steps to linearly ramp β from 0 to BETA_MAX
@@ -295,21 +295,32 @@ def compute_accuracy(logits: torch.Tensor, labels: torch.Tensor) -> float:
 # Gradient norm instrumentation (Phase B.1d)
 # ---------------------------------------------------------------------------
 
-def compute_grad_norms(model: nn.Module) -> Tuple[float, List[float]]:
-    """Compute total gradient norm and per-layer norms.
+def compute_grad_norms(model: nn.Module) -> Tuple[float, Dict[str, List[float]]]:
+    """Compute total gradient norm and per-group per-layer norms.
 
-    Aggregates parameter gradients into 6 "layer" buckets based on
-    the model's `layers.0`, `layers.1`, ..., `layers.5` naming convention.
-    Parameters not belonging to any numbered layer (embeddings, output head,
-    exit gate, register mech) are reported in total but not in per-layer.
+    Aggregates parameter gradients into three layer-group buckets based on
+    the v5 model's ``encoder_layers``, ``interpreter_layers``, and
+    ``decoder_layers`` naming convention.  Parameters not belonging to any
+    numbered layer group (embeddings, output head, exit gate, register mech)
+    are included in ``total_norm`` but not in any group bucket.
 
     Returns:
-        total_norm:     float — global L2 norm across all parameters
-        per_layer_norms: list of 6 floats — L2 norm for each transformer layer
+        total_norm:      float — global L2 norm across all parameters
+        per_group_norms: dict mapping group name ("encoder", "interpreter",
+                         "decoder") to a list of floats (one per layer in
+                         that group) giving the L2 gradient norm.
     """
     total_sq = 0.0
-    # Accumulate squared norms per layer index
-    layer_sq: Dict[int, float] = defaultdict(float)
+    # Accumulate squared norms per (group, layer_index)
+    group_sq: Dict[str, Dict[int, float]] = {
+        "encoder": defaultdict(float),
+        "interpreter": defaultdict(float),
+        "decoder": defaultdict(float),
+    }
+
+    _group_re = re.compile(
+        r"(encoder_layers|interpreter_layers|decoder_layers)\.(\d+)\."
+    )
 
     for name, p in model.named_parameters():
         if p.grad is None:
@@ -317,19 +328,26 @@ def compute_grad_norms(model: nn.Module) -> Tuple[float, List[float]]:
         g_sq = p.grad.norm().item() ** 2
         total_sq += g_sq
 
-        # Match "layers.N." to bucket into layer index N
-        m = re.match(r"layers\.(\d+)\.", name)
+        m = _group_re.search(name)
         if m:
-            layer_idx = int(m.group(1))
-            layer_sq[layer_idx] += g_sq
+            group_key = m.group(1).replace("_layers", "")  # "encoder_layers" -> "encoder"
+            layer_idx = int(m.group(2))
+            group_sq[group_key][layer_idx] += g_sq
 
     total_norm = math.sqrt(total_sq)
 
-    # Build per-layer list (always 6 entries, even if some have no params)
-    n_layers = 6
-    per_layer_norms = [math.sqrt(layer_sq.get(i, 0.0)) for i in range(n_layers)]
+    # Build per-group lists (sized to max index seen + 1, or empty)
+    per_group_norms: Dict[str, List[float]] = {}
+    for group_name, idx_map in group_sq.items():
+        if idx_map:
+            n = max(idx_map.keys()) + 1
+            per_group_norms[group_name] = [
+                math.sqrt(idx_map.get(i, 0.0)) for i in range(n)
+            ]
+        else:
+            per_group_norms[group_name] = []
 
-    return total_norm, per_layer_norms
+    return total_norm, per_group_norms
 
 
 # ---------------------------------------------------------------------------
@@ -526,10 +544,11 @@ def train(
     )
 
     # ----- AMP scaler -----
-    # fp16 autocast overflows for looped variants: 24 layer-applications
-    # (4 iters × 6 layers) with per-layer register injection blow past fp16's
-    # ~65k dynamic range, producing NaN logits. Gate amp to vanilla only until
-    # we either bf16 (needs newer GPU than P100) or norm the register path.
+    # fp16 autocast overflows for looped variants: 18 layer-applications
+    # (encoder 2 + 4 iters × (interpreter 3 + decoder 1)) with per-layer
+    # register injection blow past fp16's ~65k dynamic range, producing NaN
+    # logits. Gate amp to vanilla only until we either bf16 (needs newer GPU
+    # than P100) or norm the register path.
     use_amp = device.type == "cuda" and variant == "vanilla"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -587,9 +606,9 @@ def train(
             # the true gradient magnitudes.  Only every LOG_EVERY steps to
             # avoid overhead.
             grad_norm_total = None
-            grad_norm_per_layer = None
+            grad_norm_per_group = None
             if (step + 1) % LOG_EVERY == 0 and variant in LOOPED_VARIANTS:
-                grad_norm_total, grad_norm_per_layer = compute_grad_norms(model)
+                grad_norm_total, grad_norm_per_group = compute_grad_norms(model)
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), DEFAULT_MAX_GRAD_NORM)
             scaler.step(optimizer)
@@ -647,11 +666,12 @@ def train(
                     # Gradient norms (Phase B.1d)
                     # Computed before step+=1 using (step+1) % LOG_EVERY == 0,
                     # so the values align with this post-increment logging block.
-                    if grad_norm_total is not None and grad_norm_per_layer is not None:
+                    if grad_norm_total is not None and grad_norm_per_group is not None:
                         log_record["grad_norm_total"] = round(grad_norm_total, 5)
-                        log_record["grad_norm_per_layer"] = [
-                            round(v, 5) for v in grad_norm_per_layer
-                        ]
+                        log_record["grad_norm_per_group"] = {
+                            group: [round(v, 5) for v in norms]
+                            for group, norms in grad_norm_per_group.items()
+                        }
 
                 print(
                     f"  step {step:>6d}/{total_steps} | "

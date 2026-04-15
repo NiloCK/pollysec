@@ -61,8 +61,8 @@ os.chdir(WORK_DIR)
 PILOT = True
 
 if PILOT:
-    # v4 §C.1 — vanilla baseline + scaffolded looped_reg on ListOps.
-    # Bare `looped` (bitter-lesson test) deferred to C.2 pending C.1 results.
+    # v5 §C.1 — vanilla + looped_reg. Ponder loss w/ λ_p=0.1 replaces the
+    # uniform mean-CE used in v4 (see comment at train() call below).
     VARIANTS = ["vanilla", "looped_reg"]
     SEEDS = [100]
     STEPS = 10_000
@@ -88,11 +88,18 @@ for variant in VARIANTS:
         print(f"[{run}/{total}] Starting: {tag} (steps={STEPS})")
         print(f"{'='*60}\n")
         try:
+            # v5 C.1: revert to ponder loss with a gentler λ_p=0.1 (v4 used
+            # uniform mean-CE after ponder collapsed exits to iter 1; the root
+            # cause was λ_p=0.05 being too aggressive). Ponder loss lets the
+            # exit gate train end-to-end while the higher λ_p keeps the halting
+            # distribution from degenerating. loss_mode is a no-op for vanilla.
             train(
                 variant=variant,
                 seed=seed,
                 total_steps=STEPS,
                 device_str="auto",
+                loss_mode="ponder",
+                lambda_p=0.1,
             )
             print(f"[{run}/{total}] {tag} — done")
         except Exception as exc:
